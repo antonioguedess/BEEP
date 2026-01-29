@@ -4,155 +4,156 @@ import time
 import pandas as pd
 import matplotlib
 import sys
+import serial
+import serial.tools.list_ports
+import threading
+from datetime import datetime
 
-# --- GRAPHICAL ENGINE SETUP ---
-# Forces Matplotlib to use 'Qt5Agg', which is a high-performance backend.
-# This is crucial for real-time plotting as it allows for interactive windows 
-# and smoother frame updates compared to the default static backends.
+# --- CONFIGURAÇÕES DE COMUNICAÇÃO ---
+#SERIAL_PORT = 'COM11'  # <--- ALTERA PARA A TUA PORTA (ex: 'COM4' ou '/dev/ttyUSB0')
+BAUD_RATE = 115200
+
+# Nome dinâmico do ficheiro baseado no momento de arranque
+timestamp_inicio = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+FILE_PATH = f'BEEP_data_{timestamp_inicio}.csv'
+TEMP_PATH = 'temp_plot_debug.csv'
+COLUMNS = ['timestamp_ms', 'pos1', 'pos2', 'vel1_rpm', 'vel2_rpm', 'erro_graus']
+
+def find_esp32_port():
+    """Tenta detetar automaticamente a porta COM do ESP32"""
+    ports = list(serial.tools.list_ports.comports())
+    
+    # 1. Procura por descrições comuns de drivers de ESP32
+    for p in ports:
+        desc = p.description.upper()
+        if "CP210" in desc or "CH340" in desc or "USB SERIAL" in desc:
+            print(f"ESP32 detetado na porta: {p.device} ({p.description})")
+            return p.device
+            
+    # 2. Se não encontrar pelo nome, tenta a última porta da lista (mais provável ser a correta)
+    if ports:
+        last_port = ports[-1].device
+        print(f"Aviso: ESP32 não identificado pelo nome. Tentando a porta: {last_port}")
+        return last_port
+    
+    return None
+
+# Força o motor gráfico PyQt5 para alta performance
 try:
     matplotlib.use('Qt5Agg')
     import matplotlib.pyplot as plt
 except ImportError:
-    # Error handling if the required PyQt5 library is missing
-    print("Error: PyQt5 not found. Please install it using 'pip install PyQt5'")
+    print("Erro: PyQt5 não encontrado. Instale com 'pip install PyQt5'")
     sys.exit(1)
 
-# --- SYSTEM CONFIGURATIONS ---
-# FILE_PATH: The destination file where all your synchronized motor data will be saved.
-# Using a descriptive name like '1h' suggests a long-duration endurance test.
-FILE_PATH = 'teste_final_1h.csv'
-
-# TEMP_PATH: A temporary buffer file, often used to prevent data loss 
-# or for debugging purposes while the main file is being written.
-TEMP_PATH = 'temp_plot_debug.csv'
-
-# COLUMNS: Definitive header for the CSV file. 
-# It MUST match the order of the 'printf' statement in your ESP32 C code.
-# Includes: Time, Raw Positions (Pulse counts), Calculated RPMs, and the Sync Error (Degrees).
-COLUMNS = ['timestamp_ms', 'pos1', 'pos2', 'vel1_rpm', 'vel2_rpm', 'erro_graus']
-
-# Scale Parameters
+# Parâmetros globais de escala para o gráfico
 REF_RPM, REF_ERRO = 200, 5
 max_rpm_h, max_erro_h = REF_RPM, REF_ERRO
 
+# --- TAREFA DE LEITURA SÉRIE (THREAD) ---
+# --- TAREFA DE LEITURA SÉRIE (THREAD) ---
+def serial_logger(port):
+    print(f"Lendo {port} e gravando em {FILE_PATH}...")
+    try:
+        ser = serial.Serial(port, BAUD_RATE, timeout=1)
+        with open(FILE_PATH, 'w', encoding='utf-16') as f:
+            f.write(",".join(COLUMNS) + "\n")
+            while True:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if line and "," in line:
+                    f.write(line + "\n")
+                    f.flush()
+    except Exception as e:
+        print(f"\n[ERRO SERIAL]: {e}")
+
 def setup_plots():
-    # 1. Enable Matplotlib's Interactive Mode
-    # This allows the GUI to update its frames dynamically without blocking 
-    # the execution of the main data-acquisition loop.
     plt.ion()
-    
-    # 2. Layout Initialization
-    # Creates a figure with two vertical subplots (axes).
-    # ax1: Usually dedicated to high-level metrics (e.g., RPM or Position).
-    # ax2: Dedicated to delta metrics (e.g., Synchronization Error in degrees).
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-    fig.canvas.manager.set_window_title('BEEP Monitor - Debug Mode')
+    fig.canvas.manager.set_window_title(f'Monitorização: {FILE_PATH}')
     
-    # 3. Dynamic Text Overlay Initialization
-    # These text objects act as digital "displays" within the charts.
-    # 'transform=ax1.transAxes' pins the text to the plot's coordinate system (0.5 = middle).
-    # 'bbox' creates a solid background (yellow) to ensure readability over moving lines.
-    # 'zorder=10' ensures the text always stays on top of the plotted data.
-    
-    # Text display for the Upper Plot (ax1)
+    # Displays de texto sobrepostos aos gráficos
     t1 = ax1.text(0.5, 0.9, '', transform=ax1.transAxes, ha='center', 
                   bbox=dict(facecolor='yellow', alpha=0.9), weight='bold', zorder=10)
-    
-    # Text display for the Lower Plot (ax2)
     t2 = ax2.text(0.5, 0.9, '', transform=ax2.transAxes, ha='center', 
                   bbox=dict(facecolor='yellow', alpha=0.9), weight='bold', zorder=10)
-    
-    # Return the handles to the main loop so they can be modified with new data
     return fig, ax1, ax2, t1, t2
 
 def main():
+    # 1. Detetar porta automaticamente
+    target_port = find_esp32_port()
+    if not target_port:
+        print("Erro: Nenhum dispositivo série encontrado. Verifica a ligação USB.")
+        return
+
+    t_zero = None
+    
+    # 2. Inicia a Thread com a porta detetada
+    thread = threading.Thread(target=serial_logger, args=(target_port,), daemon=True)
+    thread.start()
+
     fig, ax1, ax2, txt_v, txt_e = setup_plots()
     last_graph_update = 0
-    
-    print(f"Monitorização preparada para: {FILE_PATH}")
-    print("A aguardar criação do ficheiro pelo ESP32...")
 
     while plt.fignum_exists(fig.number):
         try:
             if not os.path.exists(FILE_PATH):
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
 
-            # 1. SAFE COPY: Copy the live CSV to a temp file to avoid access conflicts
-            # with the process currently writing to the original file.
-            try:
-                shutil.copy2(FILE_PATH, TEMP_PATH)
-            except IOError:
-                time.sleep(0.05)
-                continue
-
-            # 2. OPTIMIZED FAST READ: Get only the last 5 rows for real-time text display
-            # Usamos low_memory=False para performance
-            df_recent = pd.read_csv(TEMP_PATH, names=COLUMNS, encoding='utf16', 
-                                    engine='python', on_bad_lines='skip').tail(5)
+            shutil.copy2(FILE_PATH, TEMP_PATH)
+            df_recent = pd.read_csv(TEMP_PATH, names=COLUMNS, encoding='utf-16', 
+                                    engine='python', on_bad_lines='skip', skiprows=1).tail(5)
             df_recent = df_recent.apply(pd.to_numeric, errors='coerce').dropna()
 
             if not df_recent.empty:
+                if t_zero is None:
+                    t_zero = df_recent.iloc[0]['timestamp_ms']
+
                 ultima = df_recent.iloc[-1]
-                t_s, v1, v2, err = ultima['timestamp_ms']/1000, ultima['vel1_rpm'], ultima['vel2_rpm'], ultima['erro_graus']
+                t_rel = (ultima['timestamp_ms'] - t_zero) / 1000
+                v1, v2, err = ultima['vel1_rpm'], ultima['vel2_rpm'], ultima['erro_graus']
 
-                # Update the on-screen digital displays (Yellow boxes)
                 txt_v.set_text(f"M1: {v1:.2f} | M2: {v2:.2f} RPM")
-                txt_e.set_text(f"ERRO: {err:.3f}º | T: {t_s:.1f}s")
+                txt_e.set_text(f"ERRO: {err:.3f}º | T_Rel: {t_rel:.1f}s")
 
-                # 3. HISTORICAL PLOT UPDATE: Dynamic refresh rate to prevent lag
-                # If test duration > 10min, slow down updates to handle large datasets
                 now = time.time()
-                update_interval = 3.0 if t_s < 600 else 10.0 # If >10min, lesser updates
+                update_interval = 2.0 if t_rel < 600 else 10.0 
 
                 if now - last_graph_update > update_interval:
-                    # Load full dataset for the complete trend lines
-                    df_full = pd.read_csv(TEMP_PATH, names=COLUMNS, encoding='utf16', 
-                                          engine='python', on_bad_lines='skip')
+                    df_full = pd.read_csv(TEMP_PATH, names=COLUMNS, encoding='utf-16', 
+                                          engine='python', on_bad_lines='skip', skiprows=1)
                     df_full = df_full.apply(pd.to_numeric, errors='coerce').dropna()
                     
                     if not df_full.empty:
-                        # Dynamic Auto-scaling for Y-axis based on historical peaks
+                        df_full['time_s'] = (df_full['timestamp_ms'] - t_zero) / 1000
                         global max_rpm_h, max_erro_h
                         max_rpm_h = max(max_rpm_h, df_full['vel1_rpm'].abs().max(), df_full['vel2_rpm'].abs().max())
                         max_erro_h = max(max_erro_h, df_full['erro_graus'].abs().max())
 
-                        # Clear old lines before redrawing (Optimized refresh)
                         for ax in [ax1, ax2]:
                             for line in ax.get_lines(): line.remove()
                         
-                        # Plot 1: Velocity Comparison (Motor 1 vs Motor 2)
-                        ax1.plot(df_full['timestamp_ms']/1000, df_full['vel1_rpm'], 'b-', alpha=0.5, linewidth=0.8)
-                        ax1.plot(df_full['timestamp_ms']/1000, df_full['vel2_rpm'], 'r-', alpha=0.5, linewidth=0.8)
+                        ax1.plot(df_full['time_s'], df_full['vel1_rpm'], 'b-', alpha=0.6, linewidth=0.8)
+                        ax1.plot(df_full['time_s'], df_full['vel2_rpm'], 'r-', alpha=0.6, linewidth=0.8)
                         ax1.set_ylim(0, max_rpm_h * 1.2)
-                        ax1.set_xlim(0, t_s * 1.1)
-                        ax1.minorticks_on()
-                        ax1.grid(True, which='major', alpha=0.7)
-                        ax1.grid(True, which='minor', alpha=0.2, linestyle=':')
+                        ax1.set_xlim(0, t_rel * 1.1)
+                        ax1.grid(True, alpha=0.3)
 
-                        # Plot 2: Synchronization Error (Degrees)
-                        ax2.plot(df_full['timestamp_ms']/1000, df_full['erro_graus'], 'g-', linewidth=0.8)
+                        ax2.plot(df_full['time_s'], df_full['erro_graus'], 'g-', linewidth=0.8)
                         ax2.set_ylim(-max_erro_h * 1.2, max_erro_h * 1.2)
-                        ax2.set_xlim(0, t_s * 1.1)
-                        ax2.minorticks_on()
-                        ax2.grid(True, which='major', alpha=0.7)
-                        ax2.grid(True, which='minor', alpha=0.2, linestyle=':')
+                        ax2.set_xlim(0, t_rel * 1.1)
+                        ax2.grid(True, alpha=0.3)
                         
                         last_graph_update = now
 
-                # Force the canvas to update with new data
                 fig.canvas.draw_idle()
                 fig.canvas.flush_events()
 
-            time.sleep(0.1) # Small delay to reduce CPU load
+            time.sleep(0.1)
+        except Exception:
+            continue
 
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"Aviso de Debug: {e}")
-            time.sleep(1)
-
-    print("\nMonitorização terminada.")
+    print(f"\nSessão terminada. Dados guardados em: {FILE_PATH}")
 
 if __name__ == "__main__":
     main()
