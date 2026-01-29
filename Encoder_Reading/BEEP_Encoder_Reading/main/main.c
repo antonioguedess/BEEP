@@ -9,6 +9,16 @@
 #include "esp_clk_tree.h" // ESP Clock Functions
 #include "freertos/FreeRTOS.h" // FreeRTOS
 #include "freertos/task.h" // FreeRTOS Task
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include <string.h>
+#include <sys/param.h>
+#include "esp_system.h"
+#include "esp_netif.h"
 
 // --- Hardware ---
 #define ENC1_A 18
@@ -18,6 +28,12 @@
 #define ENC2_B 23
 #define ENC2_Z 25
 #define PPR 3840 // Pulses Per Revolution (with 4x decoding)
+
+// --- Network ---
+#define EXAMPLE_ESP_WIFI_SSID      "BEEP_SENSOR_NODE"
+#define EXAMPLE_MAX_STA_CONN       4
+#define BROADCAST_IP               "192.168.4.255"
+#define UDP_PORT                   12345
 
 // --- Frequencies ---
 #define FREQUENCIA_MEDICAO_HZ 1000  // Measuring frequency in Hz
@@ -32,6 +48,67 @@ volatile float vel1 = 0, vel2 = 0; // Initial definition of velocity variables
 int lastPos1 = 0, lastPos2 = 0, lastZ1 = 0, lastZ2 = 0; // Last position and Z auxiliary variables
 pcnt_unit_handle_t pcntHandle1, pcntHandle2, pcntHandleZ1, pcntHandleZ2; // PCNT Handles
 const float delta_t_min = (1.0f / FREQUENCIA_MEDICAO_HZ) / 60.0f; // Time delta in minutes
+
+static const char *TAG = "BEEP_WIFI";
+
+// Função para gerir eventos de Wi-Fi
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Tentando reconectar ao Wi-Fi...");
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "Conectado! IP:" IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+void wifi_init_sta(void) {
+    esp_netif_init();
+    esp_event_loop_create_default(); // Garante que o loop de eventos existe
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    // ADICIONA ESTAS LINHAS PARA USAR O HANDLER:
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = EXAMPLE_ESP_WIFI_SSID,
+            .ssid_len = strlen(EXAMPLE_ESP_WIFI_SSID),
+            .channel = 1,
+            .authmode = WIFI_AUTH_OPEN,
+            .max_connection = EXAMPLE_MAX_STA_CONN,
+        },
+    };
+
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    esp_wifi_start();
+}
+
+void send_udp_broadcast(const char *payload) {
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = inet_addr(BROADCAST_IP);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(UDP_PORT);
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) return;
+
+    int bc = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &bc, sizeof(bc));
+
+    // Envia o "chute" de dados
+    sendto(sock, payload, strlen(payload), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    
+    close(sock);
+}
 
 // --- High Precision Callback ---
 // This function is triggered by a hardware timer interrupt at a fixed frequency (e.g., 1kHz)
@@ -101,7 +178,7 @@ pcnt_unit_handle_t setupPCNT(gpio_num_t pinA, gpio_num_t pinB, bool quadrature) 
         .max_glitch_ns = 1000 
     };
     ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(unit, &filter_config));
-    ESP_ERROR_CHECK(pcnt_unit_enable_glitch_filter(unit)); // Hardware-level noise suppression enabled
+    //ESP_ERROR_CHECK(pcnt_unit_enable_glitch_filter(unit)); // Hardware-level noise suppression enabled
 
     // 3. Channel Configuration
     // Assigns physical GPIOs to the PCNT unit
@@ -144,28 +221,39 @@ pcnt_unit_handle_t setupPCNT(gpio_num_t pinA, gpio_num_t pinB, bool quadrature) 
 }
 
 void app_main(void) {
-    // 1. Disable system logs to prevent non-CSV data from corrupting the Serial output
-    esp_log_level_set("*", ESP_LOG_NONE); 
+    
+    // 1. Inicia NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+    
+    // 2. Inicia Wi-Fi (Mantém os logs ativos aqui para veres se liga!)
+    wifi_init_sta();
 
-    // 2. Hardware Initialization
+    // 3. Hardware Initialization
     // Initialize PCNT units for position (quadrature) and rotation reference (Z-index)
     pcntHandle1  = setupPCNT(ENC1_A, ENC1_B, true);  // Motor 1 Position
     pcntHandle2  = setupPCNT(ENC2_A, ENC2_B, true);  // Motor 2 Position
     pcntHandleZ1 = setupPCNT(ENC1_Z, -1, false);     // Motor 1 Index/Reset
     pcntHandleZ2 = setupPCNT(ENC2_Z, -1, false);     // Motor 2 Index/Reset
 
-    // 3. High-Precision Background Timer
+    // 4. High-Precision Background Timer
     // Create and start a hardware timer to execute the measurement callback at a fixed frequency
     const esp_timer_create_args_t timer_args = { .callback = &periodic_timer_callback, .name = "m" };
     esp_timer_handle_t timer;
     esp_timer_create(&timer_args, &timer);
     esp_timer_start_periodic(timer, PERIOD_US_MEDICAO);
 
-    // 4. CSV Header Output
+    // 5. CSV Header Output
     // Prints the column labels for easy parsing by Python/Excel
     printf("timestamp_ms,pos1,pos2,vel1_rpm,vel2_rpm,erro_graus\n");
 
-    // 5. Main Logging Loop
+    // Opcional: silenciar logs aqui se quiseres a consola limpa para o CSV
+    esp_log_level_set("*", ESP_LOG_NONE);
+
+    // 6. Main Logging Loop
     // Periodically captures snapshots of the global data and exports them via Serial
     while (1) {
         // Capture a local "snapshot" of volatile variables to ensure data atomicity
@@ -177,8 +265,15 @@ void app_main(void) {
         float erro_g = (float)(p2 - p1) * 360.0f / (PPR * 4.0f);
         
         // Export data in CSV format: Time, Positions, Velocities, and Synchronism Error
-        printf("%llu,%d,%d,%.2f,%.2f,%.2f\n", 
+        char data[128];
+        sprintf(data, "%llu,%d,%d,%.2f,%.2f,%.2f\n", 
                 esp_timer_get_time() / 1000, p1, p2, v1, v2, erro_g);
+        
+        // Envia por USB (Standard Output)
+        printf("%s", data); 
+        
+        // Envia por Wi-Fi
+        send_udp_broadcast(data);
 
         // Block the task for a predefined logging period to free CPU resources
         vTaskDelay(pdMS_TO_TICKS(PERIOD_MS_LOG));
