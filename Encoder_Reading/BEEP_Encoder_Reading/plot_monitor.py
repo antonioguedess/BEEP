@@ -9,6 +9,8 @@ import serial.tools.list_ports
 import threading
 import socket
 from datetime import datetime
+#import pyqtgraph as pg
+#from PyQt5 import QtWidgets, QtCore
 
 # --- CONFIGURAÇÕES DE COMUNICAÇÃO ---
 BAUD_RATE = 115200
@@ -17,6 +19,14 @@ timestamp_inicio = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 FILE_PATH = f'BEEP_data_{timestamp_inicio}.csv'
 TEMP_PATH = 'temp_plot_debug.csv'
 COLUMNS = ['timestamp_ms', 'pos1', 'pos2', 'vel1_rpm', 'vel2_rpm', 'erro_graus']
+
+# Listas globais para partilha entre Threads e Gráfico
+t_zero = None
+buffer_t = []
+buffer_v1 = []
+buffer_v2 = []
+buffer_e = []
+data_lock = threading.Lock() # Garante que não há conflito de escrita/leitura
 
 # Força o motor gráfico PyQt5 para alta performance
 try:
@@ -37,33 +47,64 @@ def find_esp32_port():
 
 # --- LOGGER VIA USB (SERIAL) ---
 def serial_logger(port):
-    print(f"[SERIAL] Tentando conectar em {port}...")
+    global buffer_t, buffer_v1, buffer_v2, buffer_e
+    print(f"[SERIAL] Conectado em {port}...")
     try:
         ser = serial.Serial(port, BAUD_RATE, timeout=1)
-        with open(FILE_PATH, 'a', encoding='utf-16') as f: # 'a' para não apagar dados do Wi-Fi
+        with open(FILE_PATH, 'a', encoding='utf-16') as f:
             while True:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if line and "," in line:
+                    # Se a linha começar com "I (" ou "timestamp", ignoramos
+                    if line.startswith("I (") or "timestamp" in line:
+                        continue
+                        
                     f.write(line + "\n")
                     f.flush()
-    except Exception as e:
-        print(f"[SERIAL] Desconectado ou Erro: {e}")
+                    try:
+                        valores = [float(x.strip()) for x in line.split(',')]
+                        # Só adicionamos se tivermos os 6 campos e o primeiro for o timestamp
+                        if len(valores) == 6:
+                            with data_lock:
+                                buffer_t.append(valores[0])
+                                buffer_v1.append(valores[3])
+                                buffer_v2.append(valores[4])
+                                buffer_e.append(valores[5])
+                    except ValueError:
+                        continue
+    except Exception as e: print(f"[SERIAL] Erro: {e}")
 
 # --- LOGGER VIA WI-FI (UDP) ---
 def udp_logger():
+    global buffer_t, buffer_v1, buffer_v2, buffer_e
     print(f"[WI-FI] Ouvindo na porta UDP {UDP_PORT}...")
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(("0.0.0.0", UDP_PORT))
+        # O ficheiro continua a ser gravado para a dissertação
         with open(FILE_PATH, 'a', encoding='utf-16') as f:
             while True:
                 data, addr = sock.recvfrom(1024)
                 line = data.decode('utf-8').strip()
                 if line and "," in line:
+                    # Se a linha começar com "I (" ou "timestamp", ignoramos
+                    if line.startswith("I (") or "timestamp" in line:
+                        continue
+                        
                     f.write(line + "\n")
                     f.flush()
-    except Exception as e:
-        print(f"[WI-FI] Erro: {e}")
+                    try:
+                        valores = [float(x.strip()) for x in line.split(',')]
+                        # Só adicionamos se tivermos os 6 campos e o primeiro for o timestamp
+                        if len(valores) == 6:
+                            with data_lock:
+                                buffer_t.append(valores[0])
+                                buffer_v1.append(valores[3])
+                                buffer_v2.append(valores[4])
+                                buffer_e.append(valores[5])
+                    except ValueError:
+                        continue
+    except Exception as e: print(f"Erro UDP: {e}")
 
 # Parâmetros globais de escala para o gráfico
 REF_RPM, REF_ERRO = 200, 5
@@ -98,6 +139,16 @@ def setup_plots():
     return fig, ax1, ax2, t1, t2
 
 def main():
+    global t_zero, buffer_t, buffer_v1, buffer_v2, buffer_e
+    
+    # Reset total de dados ao iniciar
+    with data_lock:
+        buffer_t.clear()
+        buffer_v1.clear()
+        buffer_v2.clear()
+        buffer_e.clear()
+        t_zero = None     # Força o reset do tempo para esta sessão
+    
     # Cria o ficheiro inicial
     with open(FILE_PATH, 'w', encoding='utf-16') as f:
         f.write(",".join(COLUMNS) + "\n")
@@ -112,63 +163,71 @@ def main():
         print("[AVISO] Cabo USB não detetado. A aguardar apenas por Wi-Fi.")
 
     fig, ax1, ax2, txt_v, txt_e = setup_plots()
-    t_zero = None
     last_graph_update = 0
+    last_text_update = 0
     max_rpm_h, max_erro_h = 200, 3
+
+    buffer_t.clear()   # Limpa dados de execuções anteriores
+    buffer_v1.clear()
+    buffer_v2.clear()
+    buffer_e.clear()
+    t_zero = None      # Força o reset do tempo para esta sessão
 
     while plt.fignum_exists(fig.number):
         try:
-            if not os.path.exists(FILE_PATH):
-                time.sleep(0.5)
-                continue
-
-            shutil.copy2(FILE_PATH, TEMP_PATH)
+            now = time.time()
             
-            # Leitura rápida para os displays
-            df = pd.read_csv(TEMP_PATH, names=COLUMNS, encoding='utf-16', 
-                             engine='python', on_bad_lines='skip', skiprows=1).tail(5)
-            df = df.apply(pd.to_numeric, errors='coerce').dropna()
-
-            if not df.empty:
-                if t_zero is None: t_zero = df.iloc[0]['timestamp_ms']
+            # 1. Verifica se temos dados
+            with data_lock:
+                if not buffer_t:
+                    plt.pause(0.1)
+                    continue
                 
-                ultima = df.iloc[-1]
-                t_rel = (ultima['timestamp_ms'] - t_zero) / 1000
+                # Sincroniza o tempo inicial
+                if t_zero is None: t_zero = buffer_t[0]
                 
-                txt_v.set_text(f"M1: {ultima['vel1_rpm']:.2f} | M2: {ultima['vel2_rpm']:.2f} RPM")
-                txt_e.set_text(f"ERRO: {ultima['erro_graus']:.3f}º | T: {t_rel:.1f}s")
+                # Dados mais recentes para o texto
+                v1_atual = buffer_v1[-1]
+                v2_atual = buffer_v2[-1]
+                e_atual = buffer_e[-1]
+                t_rel = (buffer_t[-1] - t_zero) / 1000
 
-                # Atualização do gráfico histórico
-                now = time.time()
-                if now - last_graph_update > 2.0:
-                    df_full = pd.read_csv(TEMP_PATH, names=COLUMNS, encoding='utf-16', 
-                                         engine='python', on_bad_lines='skip', skiprows=1).dropna()
-                    df_full = df_full.apply(pd.to_numeric, errors='coerce')
-                    df_full['time_s'] = (df_full['timestamp_ms'] - t_zero) / 1000
+            # 2. ATUALIZAÇÃO DO TEXTO (Definir na condição abaixo a periodicidade de atualização)
+            if now - last_text_update >= 0.1:
+                txt_v.set_text(f"M1: {v1_atual:.2f} | M2: {v2_atual:.2f} RPM")
+                txt_e.set_text(f"ERRO: {e_atual:.3f}º | T: {t_rel:.1f}s")
+                last_text_update = now
 
-                    max_rpm_h = max(max_rpm_h, df_full['vel1_rpm'].abs().max(), df_full['vel2_rpm'].abs().max())
-                    max_erro_h = max(max_erro_h, df_full['erro_graus'].abs().max())
+            # 3. ATUALIZAÇÃO DO GRÁFICO (Definir na condição abaixo a periodicidade de atualização)
+            if now - last_graph_update >= 0.5:
+                with data_lock:
+                    idx = -500 # Últimos 500 pontos
+                    # Criamos cópias locais para o plot não travar a receção
+                    t_plot = [(x - t_zero)/1000 for x in buffer_t[idx:]]
+                    v1_plot = buffer_v1[idx:]
+                    v2_plot = buffer_v2[idx:]
+                    e_plot = buffer_e[idx:]
 
-                    for ax in [ax1, ax2]:
-                        for line in ax.get_lines(): line.remove()
-                    
-                    ax1.plot(df_full['time_s'], df_full['vel1_rpm'], 'b-', alpha=0.6, linewidth=0.8)
-                    ax1.plot(df_full['time_s'], df_full['vel2_rpm'], 'r-', alpha=0.6, linewidth=0.8)
-                    ax1.set_ylim(-10, max_rpm_h * 1.2)
-                    ax1.set_xlim(0, max(1.0, t_rel * 1.1))
-                    
-                    ax2.plot(df_full['time_s'], df_full['erro_graus'], 'g-', linewidth=0.8)
-                    ax2.set_ylim(-max_erro_h * 1.2, max_erro_h * 1.2)
-                    ax2.set_xlim(0, max(1.0, t_rel * 1.1))
-                    
-                    last_graph_update = now
+                for ax in [ax1, ax2]:
+                    for line in ax.get_lines(): line.remove()
 
-            fig.canvas.draw_idle()
-            fig.canvas.flush_events()
-            time.sleep(0.1)
+                ax1.plot(t_plot, v1_plot, 'b-', alpha=0.7, label='M1')
+                ax1.plot(t_plot, v2_plot, 'r-', alpha=0.7, label='M2')
+                ax2.plot(t_plot, e_plot, 'g-', linewidth=1)
 
-        except Exception:
-            continue
+                # Escala dinâmica do Eixo X
+                t_max = t_plot[-1]
+                ax1.set_xlim(max(0, t_max - 15), t_max + 1)
+                ax2.set_xlim(max(0, t_max - 15), t_max + 1)
+                
+                fig.canvas.draw_idle()
+                last_graph_update = now
+
+            plt.pause(0.001)
+
+        except Exception as e:
+            print(f"Erro no Loop: {e}")
+            plt.pause(0.1)
 
     print(f"\nSessão terminada. Dados guardados em: {FILE_PATH}")
 
