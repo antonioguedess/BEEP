@@ -1,7 +1,5 @@
 import os
-import shutil
 import time
-import pandas as pd
 import matplotlib
 import sys
 import serial
@@ -9,16 +7,20 @@ import serial.tools.list_ports
 import threading
 import socket
 from datetime import datetime
-#import pyqtgraph as pg
-#from PyQt5 import QtWidgets, QtCore
 
 # --- CONFIGURAÇÕES DE COMUNICAÇÃO ---
 BAUD_RATE = 115200
 UDP_PORT = 12345  # Porta para o Wi-Fi
+COLUMNS = ['timestamp_s', 'pos1', 'pos2', 'vel1_rpm', 'vel2_rpm', 'erro_graus']
+
+# --- CONFIGURAÇÕES DE PASTA E FICHEIRO ---
+DATA_FOLDER = 'BEEP_data'
+if not os.path.exists(DATA_FOLDER):
+    os.makedirs(DATA_FOLDER) # Cria a pasta se não existir
+
 timestamp_inicio = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-FILE_PATH = f'BEEP_data_{timestamp_inicio}.csv'
-TEMP_PATH = 'temp_plot_debug.csv'
-COLUMNS = ['timestamp_ms', 'pos1', 'pos2', 'vel1_rpm', 'vel2_rpm', 'erro_graus']
+# O caminho agora aponta para dentro da pasta
+FILE_PATH = os.path.join(DATA_FOLDER, f'BEEP_data_{timestamp_inicio}.csv')
 
 # Listas globais para partilha entre Threads e Gráfico
 t_zero = None
@@ -55,22 +57,30 @@ def serial_logger(port):
             while True:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if line and "," in line:
-                    # Se a linha começar com "I (" ou "timestamp", ignoramos
                     if line.startswith("I (") or "timestamp" in line:
                         continue
-                        
-                    f.write(line + "\n")
-                    f.flush()
+                    
                     try:
                         valores = [float(x.strip()) for x in line.split(',')]
-                        # Só adicionamos se tivermos os 6 campos e o primeiro for o timestamp
                         if len(valores) == 6:
+                            # 1. Converte o timestamp para segundos (decimal)
+                            tempo_decimal = valores[0] / 1000.0
+                            
+                            # 2. Cria a nova linha formatada para o CSV
+                            # Substituímos o primeiro valor pelo tempo decimal
+                            nova_linha = f"{tempo_decimal:.3f},{valores[1]},{valores[2]},{valores[3]},{valores[4]},{valores[5]}"
+                            
+                            # 3. Grava no ficheiro
+                            f.write(nova_linha + "\n")
+                            f.flush()
+
+                            # 4. Alimenta o gráfico (RAM)
                             with data_lock:
-                                buffer_t.append(valores[0])
+                                buffer_t.append(tempo_decimal)
                                 buffer_v1.append(valores[3])
                                 buffer_v2.append(valores[4])
                                 buffer_e.append(valores[5])
-                    except ValueError:
+                    except:
                         continue
     except Exception as e: print(f"[SERIAL] Erro: {e}")
 
@@ -87,22 +97,30 @@ def udp_logger():
                 data, addr = sock.recvfrom(1024)
                 line = data.decode('utf-8').strip()
                 if line and "," in line:
-                    # Se a linha começar com "I (" ou "timestamp", ignoramos
                     if line.startswith("I (") or "timestamp" in line:
                         continue
-                        
-                    f.write(line + "\n")
-                    f.flush()
+                    
                     try:
                         valores = [float(x.strip()) for x in line.split(',')]
-                        # Só adicionamos se tivermos os 6 campos e o primeiro for o timestamp
                         if len(valores) == 6:
+                            # 1. Converte o timestamp para segundos (decimal)
+                            tempo_decimal = valores[0] / 1000.0
+                            
+                            # 2. Cria a nova linha formatada para o CSV
+                            # Substituímos o primeiro valor pelo tempo decimal
+                            nova_linha = f"{tempo_decimal:.3f},{valores[1]},{valores[2]},{valores[3]},{valores[4]},{valores[5]}"
+                            
+                            # 3. Grava no ficheiro
+                            f.write(nova_linha + "\n")
+                            f.flush()
+
+                            # 4. Alimenta o gráfico (RAM)
                             with data_lock:
-                                buffer_t.append(valores[0])
+                                buffer_t.append(tempo_decimal)
                                 buffer_v1.append(valores[3])
                                 buffer_v2.append(valores[4])
                                 buffer_e.append(valores[5])
-                    except ValueError:
+                    except:
                         continue
     except Exception as e: print(f"Erro UDP: {e}")
 
@@ -190,12 +208,12 @@ def main():
                 v1_atual = buffer_v1[-1]
                 v2_atual = buffer_v2[-1]
                 e_atual = buffer_e[-1]
-                t_rel = (buffer_t[-1] - t_zero) / 1000
+                t_rel = (buffer_t[-1] - t_zero)
 
             # 2. ATUALIZAÇÃO DO TEXTO (Definir na condição abaixo a periodicidade de atualização)
             if now - last_text_update >= 0.1:
                 txt_v.set_text(f"M1: {v1_atual:.2f} | M2: {v2_atual:.2f} RPM")
-                txt_e.set_text(f"ERRO: {e_atual:.3f}º | T: {t_rel:.1f}s")
+                txt_e.set_text(f"ERRO: {e_atual:.3f}º | T: {t_rel:.3f}s")
                 last_text_update = now
 
             # 3. ATUALIZAÇÃO DO GRÁFICO (Definir na condição abaixo a periodicidade de atualização)
@@ -203,7 +221,7 @@ def main():
                 with data_lock:
                     idx = -500 # Últimos 500 pontos
                     # Criamos cópias locais para o plot não travar a receção
-                    t_plot = [(x - t_zero)/1000 for x in buffer_t[idx:]]
+                    t_plot = [(x - t_zero) for x in buffer_t[idx:]]
                     v1_plot = buffer_v1[idx:]
                     v2_plot = buffer_v2[idx:]
                     e_plot = buffer_e[idx:]
