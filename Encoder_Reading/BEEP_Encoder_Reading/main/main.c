@@ -267,7 +267,7 @@ void app_main(void) {
         // Export data in CSV format: Time, Positions, Velocities, and Synchronism Error
         char data[128];
         sprintf(data, "%llu,%d,%d,%.2f,%.2f,%.2f\n", 
-                esp_timer_get_time() / 1000, p1, p2, v1, v2, erro_g);
+                esp_timer_get_time(), p1, p2, v1, v2, erro_g);
         
         // Envia por USB (Standard Output)
         printf("%s", data); 

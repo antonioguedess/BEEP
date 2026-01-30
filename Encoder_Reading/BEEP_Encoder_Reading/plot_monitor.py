@@ -64,11 +64,11 @@ def serial_logger(port):
                         valores = [float(x.strip()) for x in line.split(',')]
                         if len(valores) == 6:
                             # 1. Converte o timestamp para segundos (decimal)
-                            tempo_decimal = valores[0] / 1000.0
+                            tempo_decimal = valores[0] / 1000000.0
                             
                             # 2. Cria a nova linha formatada para o CSV
                             # Substituímos o primeiro valor pelo tempo decimal
-                            nova_linha = f"{tempo_decimal:.3f},{valores[1]},{valores[2]},{valores[3]},{valores[4]},{valores[5]}"
+                            nova_linha = f"{tempo_decimal:.6f},{valores[1]},{valores[2]},{valores[3]},{valores[4]},{valores[5]}"
                             
                             # 3. Grava no ficheiro
                             f.write(nova_linha + "\n")
@@ -108,7 +108,7 @@ def udp_logger():
                             
                             # 2. Cria a nova linha formatada para o CSV
                             # Substituímos o primeiro valor pelo tempo decimal
-                            nova_linha = f"{tempo_decimal:.3f},{valores[1]},{valores[2]},{valores[3]},{valores[4]},{valores[5]}"
+                            nova_linha = f"{tempo_decimal:.6f},{valores[1]},{valores[2]},{valores[3]},{valores[4]},{valores[5]}"
                             
                             # 3. Grava no ficheiro
                             f.write(nova_linha + "\n")
