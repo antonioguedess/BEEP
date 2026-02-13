@@ -7,9 +7,11 @@ import serial.tools.list_ports
 import threading
 import socket
 from datetime import datetime
+from collections import Counter
+import numpy as np
 
 # --- CONFIGURAÇÕES DE COMUNICAÇÃO ---
-BAUD_RATE = 115200
+BAUD_RATE = 921600
 UDP_PORT = 12345  # Porta para o Wi-Fi
 COLUMNS = ['timestamp_s', 'pos1', 'pos2', 'vel1_rpm', 'vel2_rpm', 'erro_graus', 'erro_us']
 
@@ -50,80 +52,175 @@ def find_esp32_port():
 # --- LOGGER VIA USB (SERIAL) ---
 def serial_logger(port):
     global buffer_t, buffer_v1, buffer_v2, buffer_e
-    print(f"[SERIAL] Conectado em {port}...")
     try:
-        ser = serial.Serial(port, BAUD_RATE, timeout=1)
+        ser = serial.Serial(port, BAUD_RATE, timeout=0.01)
+        ser.set_buffer_size(rx_size=128000, tx_size=128000)
+        ser.reset_input_buffer()
+        
+        last_valid_t = 0
+        error_samples = []
+        stable_error_us = None
+        calibration_limit = 500 
+
         with open(FILE_PATH, 'a', encoding='utf-16') as f:
             while True:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                #print(f"DEBUG: Recebi -> {line}")
-                if line and "," in line:
-                    if line.startswith("I (") or "timestamp" in line:
-                        continue
+                if ser.in_waiting > 500:
+                    raw = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+                    chunks = raw.split('$')[1:] 
                     
-                    try:
-                        valores = [float(x.strip()) for x in line.split(',')]
-                        if len(valores) == 7:
-                            # 1. Converte o timestamp para segundos (decimal)
-                            tempo_decimal = valores[0] / 1000000.0
+                    for chunk in chunks:
+                        try:
+                            line = chunk.split('\n')[0].strip()
+                            parts = line.split(',')
+                            if len(parts) < 7: continue
                             
-                            # 2. Cria a nova linha formatada para o CSV
-                            # Substituímos o primeiro valor pelo tempo decimal
-                            nova_linha = f"{tempo_decimal:.6f},{valores[1]},{valores[2]},{valores[3]},{valores[4]},{valores[5]},{valores[6]}"
-                            
-                            # 3. Grava no ficheiro
-                            f.write(nova_linha + "\n")
-                            f.flush()
+                            val = [float(x) for x in parts]
+                            current_err_us = val[6]
 
-                            # 4. Alimenta o gráfico (RAM)
+                            # 1. Calibração do erro estável
+                            if stable_error_us is None:
+                                error_samples.append(current_err_us)
+                                if len(error_samples) >= calibration_limit:
+                                    stable_error_us = Counter(error_samples).most_common(1)[0][0]
+                                    print(f"[*] Estabilidade em: {stable_error_us} us")
+                                continue 
+
+                            # 2. Filtro de Jitter (Tolerância de 2us)
+                            if abs(current_err_us - stable_error_us) > 2:
+                                continue
+
+                            # 3. CÁLCULO DO OFFSET DINÂMICO
+                            # Aplicando a tua fórmula: (current_err - 1) / 4
+                            offset_us = (current_err_us - 1.0) / 4.0
+                            dt_s = offset_us / 1000000.0
+                            
+                            # 4. COMPENSAÇÃO DA POSIÇÃO 2
+                            # v2_deg_s = RPM * 6
+                            v2_deg_s = val[4] * 6.0
+                            pos2_corrigida = val[2] - (v2_deg_s * dt_s)
+                            
+                            # Erro angular real (Pos1 - Pos2_corrigida)
+                            erro_angular_real = val[1] - pos2_corrigida
+
+                            t_s = val[0] / 1000000.0
+                            if t_s <= last_valid_t or t_s > last_valid_t + 2.0:
+                                continue
+                            
+                            last_valid_t = t_s
+                            
+                            # Gravação com Pos2 e Erro corrigidos
+                            f.write(f"{t_s:.6f},{val[1]:.2f},{pos2_corrigida:.4f},{val[3]:.2f},{val[4]:.2f},{erro_angular_real:.4f},{val[6]}\n")
+                            
                             with data_lock:
-                                buffer_t.append(tempo_decimal)
-                                buffer_v1.append(valores[3])
-                                buffer_v2.append(valores[4])
-                                buffer_e.append(valores[5])
-                    except:
-                        continue
-    except Exception as e: print(f"[SERIAL] Erro: {e}")
+                                buffer_t.append(t_s)
+                                buffer_v1.append(val[3])
+                                buffer_v2.append(val[4])
+                                buffer_e.append(erro_angular_real)
+                                
+                                if len(buffer_t) > 2000:
+                                    buffer_t.pop(0)
+                                    buffer_v1.pop(0)
+                                    buffer_v2.pop(0)
+                                    buffer_e.pop(0)
+                        except:
+                            continue
+                    f.flush()
+                else:
+                    time.sleep(0.001)
+    except Exception as e: print(f"Erro: {e}")
 
 # --- LOGGER VIA WI-FI (UDP) ---
 def udp_logger():
     global buffer_t, buffer_v1, buffer_v2, buffer_e
     print(f"[WI-FI] Ouvindo na porta UDP {UDP_PORT}...")
+    
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(("0.0.0.0", UDP_PORT))
-        # O ficheiro continua a ser gravado para a dissertação
+        
+        # --- Variáveis para Calibração e Correção ---
+        last_valid_t = 0
+        error_samples = []
+        stable_error_us = None
+        calibration_limit = 500  # Amostras para detetar o valor estável (moda)
+        
         with open(FILE_PATH, 'a', encoding='utf-16') as f:
             while True:
-                data, addr = sock.recvfrom(1024)
-                line = data.decode('utf-8').strip()
-                if line and "," in line:
-                    if line.startswith("I (") or "timestamp" in line:
-                        continue
-                    
+                # Receção dos dados via UDP
+                data, addr = sock.recvfrom(4096)
+                raw_data = data.decode('utf-8', errors='ignore')
+                
+                # Sincronização pelo marcador '$' (ignora o primeiro elemento se estiver incompleto)
+                chunks = raw_data.split('$')[1:]
+                
+                for chunk in chunks:
                     try:
-                        valores = [float(x.strip()) for x in line.split(',')]
-                        if len(valores) == 6:
-                            # 1. Converte o timestamp para segundos (decimal)
-                            tempo_decimal = valores[0] / 1000.0
-                            
-                            # 2. Cria a nova linha formatada para o CSV
-                            # Substituímos o primeiro valor pelo tempo decimal
-                            nova_linha = f"{tempo_decimal:.6f},{valores[1]},{valores[2]},{valores[3]},{valores[4]},{valores[5]},{valores[6]}"
-                            
-                            # 3. Grava no ficheiro
-                            f.write(nova_linha + "\n")
-                            f.flush()
+                        # Limpeza da linha e separação dos valores
+                        line = chunk.split('\n')[0].strip()
+                        parts = line.split(',')
+                        if len(parts) < 7: continue
+                        
+                        val = [float(x.strip()) for x in parts]
+                        # Estrutura: [0]t_us, [1]pos1, [2]pos2, [3]v1, [4]v2, [5]err_g, [6]err_us
+                        current_err_us = val[6]
 
-                            # 4. Alimenta o gráfico (RAM)
-                            with data_lock:
-                                buffer_t.append(tempo_decimal)
-                                buffer_v1.append(valores[3])
-                                buffer_v2.append(valores[4])
-                                buffer_e.append(valores[5])
-                    except:
+                        # 1. FASE DE CALIBRAÇÃO: Identifica o erro_us mais frequente
+                        if stable_error_us is None:
+                            error_samples.append(current_err_us)
+                            if len(error_samples) >= calibration_limit:
+                                stable_error_us = Counter(error_samples).most_common(1)[0][0]
+                                print(f"[*] UDP: Estabilidade detetada em {stable_error_us} us")
+                            continue
+
+                        # 2. FILTRAGEM DE JITTER: Aceita apenas amostras estáveis (+/- 2us)
+                        if abs(current_err_us - stable_error_us) > 2:
+                            continue
+
+                        # 3. CÁLCULO DO OFFSET DINÂMICO (Tua fórmula)
+                        # O desfasamento entre Encoder 1 e 2 é (erro_total - 1) / 4
+                        offset_us = (current_err_us - 1.0) / 4.0
+                        dt_s = offset_us / 1000000.0
+                        
+                        # Correção da posição 2 (v2_rpm * 6 = graus por segundo)
+                        v2_deg_s = val[4] * 6.0
+                        pos2_corrigida = val[2] - (v2_deg_s * dt_s)
+                        
+                        # Recálculo do erro angular real sincronizado
+                        erro_angular_real = val[1] - pos2_corrigida
+
+                        tempo_decimal = val[0] / 1000000.0
+
+                        # 4. FILTRO DE SEGURANÇA TEMPORAL
+                        if tempo_decimal <= last_valid_t or tempo_decimal > last_valid_t + 2.0:
+                            continue
+                        last_valid_t = tempo_decimal
+
+                        # Gravação dos dados corrigidos no CSV
+                        nova_linha = f"{tempo_decimal:.6f},{val[1]:.2f},{pos2_corrigida:.4f},{val[3]:.2f},{val[4]:.2f},{erro_angular_real:.4f},{val[6]}"
+                        f.write(nova_linha + "\n")
+                        
+                        # Atualização dos buffers para o gráfico (respeitando o data_lock)
+                        with data_lock:
+                            buffer_t.append(tempo_decimal)
+                            buffer_v1.append(val[3])
+                            buffer_v2.append(val[4])
+                            buffer_e.append(erro_angular_real)
+                            
+                            # Limitação do tamanho do buffer para performance
+                            if len(buffer_t) > 2000:
+                                buffer_t.pop(0)
+                                buffer_v1.pop(0)
+                                buffer_v2.pop(0)
+                                buffer_e.pop(0)
+
+                    except Exception:
                         continue
-    except Exception as e: print(f"Erro UDP: {e}")
+                
+                # Garante escrita no disco sem esperar pelo fecho do ficheiro
+                f.flush()
+                
+    except Exception as e: 
+        print(f"Erro UDP: {e}")
 
 # Parâmetros globais de escala para o gráfico
 REF_RPM, REF_ERRO = 200, 5
@@ -158,24 +255,28 @@ def setup_plots():
     return fig, ax1, ax2, t1, t2
 
 def main():
+
     global t_zero, buffer_t, buffer_v1, buffer_v2, buffer_e
-    
+
     # Reset total de dados ao iniciar
+
     with data_lock:
         buffer_t.clear()
         buffer_v1.clear()
         buffer_v2.clear()
         buffer_e.clear()
         t_zero = None     # Força o reset do tempo para esta sessão
-    
+
     # Cria o ficheiro inicial
+
     with open(FILE_PATH, 'w', encoding='utf-16') as f:
         f.write(",".join(COLUMNS) + "\n")
 
     # Inicia as duas vias de comunicação
     threading.Thread(target=udp_logger, daemon=True).start()
-    
+
     usb_port = find_esp32_port()
+
     if usb_port:
         threading.Thread(target=serial_logger, args=(usb_port,), daemon=True).start()
     else:
@@ -195,16 +296,15 @@ def main():
     while plt.fignum_exists(fig.number):
         try:
             now = time.time()
-            
             # 1. Verifica se temos dados
             with data_lock:
                 if not buffer_t:
                     plt.pause(0.1)
                     continue
-                
+
                 # Sincroniza o tempo inicial
                 if t_zero is None: t_zero = buffer_t[0]
-                
+
                 # Dados mais recentes para o texto
                 v1_atual = buffer_v1[-1]
                 v2_atual = buffer_v2[-1]
@@ -218,14 +318,16 @@ def main():
                 last_text_update = now
 
             # 3. ATUALIZAÇÃO DO GRÁFICO (Definir na condição abaixo a periodicidade de atualização)
-            if now - last_graph_update >= 0.5:
+            if now - last_graph_update >= 1:
                 with data_lock:
-                    idx = -500 # Últimos 500 pontos
+                    idx = -200 # Últimos 500 pontos
                     # Criamos cópias locais para o plot não travar a receção
-                    t_plot = [(x - t_zero) for x in buffer_t[idx:]]
+                    t_slice = buffer_t[idx:]
                     v1_plot = buffer_v1[idx:]
                     v2_plot = buffer_v2[idx:]
                     e_plot = buffer_e[idx:]
+
+                t_plot = [(x - t_zero) for x in t_slice]
 
                 for ax in [ax1, ax2]:
                     for line in ax.get_lines(): line.remove()
@@ -238,11 +340,12 @@ def main():
                 t_max = t_plot[-1]
                 ax1.set_xlim(max(0, t_max - 15), t_max + 1)
                 ax2.set_xlim(max(0, t_max - 15), t_max + 1)
-                
+
                 fig.canvas.draw_idle()
                 last_graph_update = now
 
-            plt.pause(0.001)
+            plt.pause(0.01)
+
 
         except Exception as e:
             print(f"Erro no Loop: {e}")
