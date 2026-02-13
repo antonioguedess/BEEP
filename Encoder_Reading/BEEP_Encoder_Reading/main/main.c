@@ -19,6 +19,7 @@
 #include <sys/param.h>
 #include "esp_system.h"
 #include "esp_netif.h"
+#include <stdint.h>
 
 // --- Hardware ---
 #define ENC1_A 18
@@ -48,6 +49,7 @@ volatile float vel1 = 0, vel2 = 0; // Initial definition of velocity variables
 int lastPos1 = 0, lastPos2 = 0, lastZ1 = 0, lastZ2 = 0; // Last position and Z auxiliary variables
 pcnt_unit_handle_t pcntHandle1, pcntHandle2, pcntHandleZ1, pcntHandleZ2; // PCNT Handles
 const float delta_t_min = (1.0f / FREQUENCIA_MEDICAO_HZ) / 60.0f; // Time delta in minutes
+volatile int erro = 0; // Timing variables for performance measurement
 
 static const char *TAG = "BEEP_WIFI";
 
@@ -114,15 +116,19 @@ void send_udp_broadcast(const char *payload) {
 // This function is triggered by a hardware timer interrupt at a fixed frequency (e.g., 1kHz)
 static void periodic_timer_callback(void* arg) {
     int z1 = 0, z2 = 0;
+    int64_t t1 = 0, t2 = 0;
     int current_pos1 = 0, current_pos2 = 0;
 
     // 1. Fetch raw pulse counts directly from the hardware PCNT units
     // current_pos stores the quadrature count (position)
     // z stores the cumulative count of Index pulses (rotations)
+    t1 = esp_timer_get_time();
     pcnt_unit_get_count(pcntHandle1, &current_pos1);
     pcnt_unit_get_count(pcntHandle2, &current_pos2);
     pcnt_unit_get_count(pcntHandleZ1, &z1);
     pcnt_unit_get_count(pcntHandleZ2, &z2);
+    t2 = esp_timer_get_time();
+    
 
     // 2. CALCULATE VELOCITY (RPM) FIRST
     // We calculate RPM using the raw count BEFORE any reset logic.
@@ -156,6 +162,7 @@ static void periodic_timer_callback(void* arg) {
     // These volatile variables will be read by the main loop for logging/display
     pos1 = current_pos1;
     pos2 = current_pos2;
+    erro = (int)(t2 - t1); // Store timing error for performance measurement
 }
 
 // --- Setup Pulse Counter (PCNT) Unit ---
@@ -248,7 +255,7 @@ void app_main(void) {
 
     // 5. CSV Header Output
     // Prints the column labels for easy parsing by Python/Excel
-    printf("timestamp_ms,pos1,pos2,vel1_rpm,vel2_rpm,erro_graus\n");
+    printf("timestamp_ms,pos1,pos2,vel1_rpm,vel2_rpm,erro_graus,erro_ticks\n");
 
     // Opcional: silenciar logs aqui se quiseres a consola limpa para o CSV
     esp_log_level_set("*", ESP_LOG_NONE);
@@ -259,6 +266,7 @@ void app_main(void) {
         // Capture a local "snapshot" of volatile variables to ensure data atomicity
         int p1 = pos1, p2 = pos2;
         float v1 = vel1, v2 = vel2;
+        int erro1 = erro;
 
         // Calculate the angular error in degrees between the two shafts
         // Formula: (Delta_Pulses) * 360 / (Resolution * 4)
@@ -266,8 +274,8 @@ void app_main(void) {
         
         // Export data in CSV format: Time, Positions, Velocities, and Synchronism Error
         char data[128];
-        sprintf(data, "%llu,%d,%d,%.2f,%.2f,%.2f\n", 
-                esp_timer_get_time(), p1, p2, v1, v2, erro_g);
+        sprintf(data, "%llu,%d,%d,%.2f,%.2f,%.2f,%d\n", 
+                esp_timer_get_time(), p1, p2, v1, v2, erro_g, erro1);
         
         // Envia por USB (Standard Output)
         printf("%s", data); 

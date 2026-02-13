@@ -11,7 +11,7 @@ from datetime import datetime
 # --- CONFIGURAÇÕES DE COMUNICAÇÃO ---
 BAUD_RATE = 115200
 UDP_PORT = 12345  # Porta para o Wi-Fi
-COLUMNS = ['timestamp_s', 'pos1', 'pos2', 'vel1_rpm', 'vel2_rpm', 'erro_graus']
+COLUMNS = ['timestamp_s', 'pos1', 'pos2', 'vel1_rpm', 'vel2_rpm', 'erro_graus', 'erro_us']
 
 # --- CONFIGURAÇÕES DE PASTA E FICHEIRO ---
 DATA_FOLDER = 'BEEP_data'
@@ -56,19 +56,20 @@ def serial_logger(port):
         with open(FILE_PATH, 'a', encoding='utf-16') as f:
             while True:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
+                #print(f"DEBUG: Recebi -> {line}")
                 if line and "," in line:
                     if line.startswith("I (") or "timestamp" in line:
                         continue
                     
                     try:
                         valores = [float(x.strip()) for x in line.split(',')]
-                        if len(valores) == 6:
+                        if len(valores) == 7:
                             # 1. Converte o timestamp para segundos (decimal)
                             tempo_decimal = valores[0] / 1000000.0
                             
                             # 2. Cria a nova linha formatada para o CSV
                             # Substituímos o primeiro valor pelo tempo decimal
-                            nova_linha = f"{tempo_decimal:.6f},{valores[1]},{valores[2]},{valores[3]},{valores[4]},{valores[5]}"
+                            nova_linha = f"{tempo_decimal:.6f},{valores[1]},{valores[2]},{valores[3]},{valores[4]},{valores[5]},{valores[6]}"
                             
                             # 3. Grava no ficheiro
                             f.write(nova_linha + "\n")
@@ -108,7 +109,7 @@ def udp_logger():
                             
                             # 2. Cria a nova linha formatada para o CSV
                             # Substituímos o primeiro valor pelo tempo decimal
-                            nova_linha = f"{tempo_decimal:.6f},{valores[1]},{valores[2]},{valores[3]},{valores[4]},{valores[5]}"
+                            nova_linha = f"{tempo_decimal:.6f},{valores[1]},{valores[2]},{valores[3]},{valores[4]},{valores[5]},{valores[6]}"
                             
                             # 3. Grava no ficheiro
                             f.write(nova_linha + "\n")
