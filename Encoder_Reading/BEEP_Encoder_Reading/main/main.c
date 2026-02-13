@@ -37,11 +37,18 @@
 #define UDP_PORT                   12345
 
 // --- Frequencies ---
-#define FREQUENCIA_MEDICAO_HZ 1000  // Measuring frequency in Hz
-#define FREQUENCIA_LOG_HZ     10    // Logging frequency in Hz
+#define FREQUENCIA_MEDICAO_HZ 3060  // Measuring frequency in Hz
+#define FREQUENCIA_LOG_HZ     1020    // Logging frequency in Hz
 
 #define PERIOD_US_MEDICAO     (1000000 / FREQUENCIA_MEDICAO_HZ) // Measuring period in microseconds
-#define PERIOD_MS_LOG         (1000 / FREQUENCIA_LOG_HZ) // Logging period in milliseconds
+#define PERIOD_US_LOG         (1000000 / FREQUENCIA_LOG_HZ) // Logging period in microseconds
+
+// --- Filter Variables ---
+#define FILTER_SIZE FREQUENCIA_MEDICAO_HZ/FREQUENCIA_LOG_HZ  // Média das últimas leituras
+float buffer_vel1[FILTER_SIZE] = {0};
+float buffer_vel2[FILTER_SIZE] = {0};
+int filter_idx = 0;
+volatile float vel1_filtered = 0, vel2_filtered = 0;
 
 // --- Global Variables ---
 volatile int pos1 = 0, pos2 = 0; // Initial definition of position variables
@@ -50,6 +57,14 @@ int lastPos1 = 0, lastPos2 = 0, lastZ1 = 0, lastZ2 = 0; // Last position and Z a
 pcnt_unit_handle_t pcntHandle1, pcntHandle2, pcntHandleZ1, pcntHandleZ2; // PCNT Handles
 const float delta_t_min = (1.0f / FREQUENCIA_MEDICAO_HZ) / 60.0f; // Time delta in minutes
 volatile int erro = 0; // Timing variables for performance measurement
+
+// 1. Criar um semáforo
+SemaphoreHandle_t timer_sem;
+
+// 2. Novo callback do timer de logging (executa a 10Hz)
+static void logging_timer_callback(void* arg) {
+    xSemaphoreGiveFromISR(timer_sem, NULL); // Acorda a tarefa
+}
 
 static const char *TAG = "BEEP_WIFI";
 
@@ -129,15 +144,26 @@ static void periodic_timer_callback(void* arg) {
     pcnt_unit_get_count(pcntHandleZ2, &z2);
     t2 = esp_timer_get_time();
     
+    // 1. Cálculo da velocidade instantânea (já tinhas feito)
+    float v1_inst = (float)(current_pos1 - lastPos1) / (PPR * 4.0f) / delta_t_min;
+    float v2_inst = (float)(current_pos2 - lastPos2) / (PPR * 4.0f) / delta_t_min;
+    
+    // 2. Atualiza o Buffer Circular
+    buffer_vel1[filter_idx] = v1_inst;
+    buffer_vel2[filter_idx] = v2_inst;
+    filter_idx = (filter_idx + 1) % FILTER_SIZE;
 
-    // 2. CALCULATE VELOCITY (RPM) FIRST
-    // We calculate RPM using the raw count BEFORE any reset logic.
-    // This ensures continuity and avoids velocity spikes/drops when the Index (Z) resets the counter.
-    // Formula: Delta_Position / (Resolution * 4 for quadrature) / Delta_Time_in_minutes
-    vel1 = (float)(current_pos1 - lastPos1) / (PPR * 4.0f) / delta_t_min;
-    vel2 = (float)(current_pos2 - lastPos2) / (PPR * 4.0f) / delta_t_min;
+    // 3. Calcula a Média Móvel
+    float sum1 = 0, sum2 = 0;
+    for(int i = 0; i < FILTER_SIZE; i++) {
+        sum1 += buffer_vel1[i];
+        sum2 += buffer_vel2[i];
+    }
 
-    // 3. INDEX (Z) RESET LOGIC for Absolute Position
+    vel1_filtered = sum1 / FILTER_SIZE;
+    vel2_filtered = sum2 / FILTER_SIZE;
+
+    // 4. INDEX (Z) RESET LOGIC for Absolute Position
     // Motor 1: Check if a new Index pulse was detected since the last execution
     if (z1 != lastZ1) { 
         pcnt_unit_clear_count(pcntHandle1); // Hardware reset of the pulse counter
@@ -158,7 +184,7 @@ static void periodic_timer_callback(void* arg) {
         lastPos2 = current_pos2;
     }
 
-    // 4. Update Global Variables
+    // 5. Update Global Variables
     // These volatile variables will be read by the main loop for logging/display
     pos1 = current_pos1;
     pos2 = current_pos2;
@@ -228,7 +254,7 @@ pcnt_unit_handle_t setupPCNT(gpio_num_t pinA, gpio_num_t pinB, bool quadrature) 
 }
 
 void app_main(void) {
-    
+
     // 1. Inicia NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -253,6 +279,16 @@ void app_main(void) {
     esp_timer_create(&timer_args, &timer);
     esp_timer_start_periodic(timer, PERIOD_US_MEDICAO);
 
+    timer_sem = xSemaphoreCreateBinary(); // Create a binary semaphore for synchronizing the logging task with the timer
+
+    const esp_timer_create_args_t log_timer_args = { 
+        .callback = &logging_timer_callback, 
+        .name = "log_timer" 
+    };
+    esp_timer_handle_t log_timer;
+    esp_timer_create(&log_timer_args, &log_timer);
+    esp_timer_start_periodic(log_timer, PERIOD_US_LOG);
+
     // 5. CSV Header Output
     // Prints the column labels for easy parsing by Python/Excel
     printf("timestamp_ms,pos1,pos2,vel1_rpm,vel2_rpm,erro_graus,erro_ticks\n");
@@ -263,27 +299,31 @@ void app_main(void) {
     // 6. Main Logging Loop
     // Periodically captures snapshots of the global data and exports them via Serial
     while (1) {
-        // Capture a local "snapshot" of volatile variables to ensure data atomicity
-        int p1 = pos1, p2 = pos2;
-        float v1 = vel1, v2 = vel2;
-        int erro1 = erro;
+        
+        // 4. A tarefa fica a dormir aqui sem gastar CPU
+        // Ela acorda no microssegundo exato em que o timer dispara
+        if (xSemaphoreTake(timer_sem, portMAX_DELAY)) {
+        
+            // Capture a local "snapshot" of volatile variables to ensure data atomicity
+            int p1 = pos1, p2 = pos2;
+            float v1 = vel1_filtered, v2 = vel2_filtered;
+            int erro1 = erro;
 
-        // Calculate the angular error in degrees between the two shafts
-        // Formula: (Delta_Pulses) * 360 / (Resolution * 4)
-        float erro_g = (float)(p2 - p1) * 360.0f / (PPR * 4.0f);
-        
-        // Export data in CSV format: Time, Positions, Velocities, and Synchronism Error
-        char data[128];
-        sprintf(data, "%llu,%d,%d,%.2f,%.2f,%.2f,%d\n", 
-                esp_timer_get_time(), p1, p2, v1, v2, erro_g, erro1);
-        
-        // Envia por USB (Standard Output)
-        printf("%s", data); 
-        
-        // Envia por Wi-Fi
-        send_udp_broadcast(data);
+            // Calculate the angular error in degrees between the two shafts
+            // Formula: (Delta_Pulses) * 360 / (Resolution * 4)
+            float erro_g = (float)(p2 - p1) * 360.0f / (PPR * 4.0f);
+            
+            // Export data in CSV format: Time, Positions, Velocities, and Synchronism Error
+            char data[128];
+            sprintf(data, "%llu,%d,%d,%.2f,%.2f,%.2f,%d\n", 
+                    esp_timer_get_time(), p1, p2, v1, v2, erro_g, erro1);
+            
+            // Envia por USB (Standard Output)
+            printf("%s", data); 
+            
+            // Envia por Wi-Fi
+            send_udp_broadcast(data);
 
-        // Block the task for a predefined logging period to free CPU resources
-        vTaskDelay(pdMS_TO_TICKS(PERIOD_MS_LOG));
+        }
     }
 }
