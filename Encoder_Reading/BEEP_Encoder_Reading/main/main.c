@@ -32,7 +32,7 @@ char* volatile read_ptr = NULL;
 int current_buffer_len = 0;
 
 // --- Frequencies ---
-#define FREQUENCY_HZ 1000 
+#define FREQUENCY_HZ 2400 
 #define PERIOD_US (1000000 / FREQUENCY_HZ)
 
 // --- Global Variables ---
@@ -53,6 +53,7 @@ QueueHandle_t data_queue;
 // --- High Precision Callback ---
 // This function is triggered by a hardware timer interrupt at a fixed frequency (e.g., 1kHz)
 static void IRAM_ATTR periodic_timer_callback(void* arg) {
+
     int64_t t1 = esp_timer_get_time();
     int16_t c1 = pcnt_ll_get_count(&PCNT, 0); 
     int16_t c2 = pcnt_ll_get_count(&PCNT, 1);
@@ -63,13 +64,23 @@ static void IRAM_ATTR periodic_timer_callback(void* arg) {
     // Cálculos instantâneos
     float v1 = (float)(c1 - lastPos1) / (PPR * 4.0f) / delta_t_min;
     float v2 = (float)(c2 - lastPos2) / (PPR * 4.0f) / delta_t_min;
+    float erro = 360.0f * (float)(c1 - c2) / (PPR * 4.0f);
 
-    // Reset por Index Z
-    if (z1 != lastZ1) { pcnt_unit_clear_count(pcntHandle1); c1 = 0; lastPos1 = 0; lastZ1 = z1; } 
-    else { lastPos1 = c1; }
-    if (z2 != lastZ2) { pcnt_unit_clear_count(pcntHandle2); c2 = 0; lastZ2 = z2; } 
-    else { lastPos2 = c2; }
-    float erro = c2 - c1;
+    if (z1 != lastZ1) { 
+        pcnt_unit_clear_count(pcntHandle1); 
+        lastPos1 = 0;  // <--- IMPORTANTE: O próximo ciclo começará do 0
+        lastZ1 = z1;
+    } else { 
+        lastPos1 = c1;
+    }
+
+    if (z2 != lastZ2) { 
+        pcnt_unit_clear_count(pcntHandle2); 
+        lastPos2 = 0;  // <--- IMPORTANTE: O próximo ciclo começará do 0
+        lastZ2 = z2;
+    } else { 
+        lastPos2 = c2;
+    }
 
     data_sample_t sample = {
         .t = t1,
