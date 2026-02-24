@@ -13,7 +13,7 @@ import numpy as np
 # --- CONFIGURAÇÕES DE COMUNICAÇÃO ---
 BAUD_RATE = 921600
 UDP_PORT = 12345  # Porta para o Wi-Fi
-COLUMNS = ['timestamp_s', 'pos1', 'pos2', 'vel1_rpm', 'vel2_rpm', 'erro_graus', 'erro_us']
+COLUMNS = ['timestamp_s', 'pos1', 'pos2', 'vel1_rpm', 'vel2_rpm', 'erro_graus', 'erro_ns']
 
 # --- CONFIGURAÇÕES DE PASTA E FICHEIRO ---
 DATA_FOLDER = 'BEEP_data'
@@ -59,7 +59,7 @@ def serial_logger(port):
         
         last_valid_t = 0
         error_samples = []
-        stable_error_us = None
+        stable_error_ticks = None
         calibration_limit = 500 
 
         with open(FILE_PATH, 'a', encoding='utf-16') as f:
@@ -75,24 +75,24 @@ def serial_logger(port):
                             if len(parts) < 7: continue
                             
                             val = [float(x) for x in parts]
-                            current_err_us = val[6]
+                            current_err_ticks = val[6]
 
                             # 1. Calibração do erro estável
-                            if stable_error_us is None:
-                                error_samples.append(current_err_us)
+                            if stable_error_ticks is None:
+                                error_samples.append(current_err_ticks)
                                 if len(error_samples) >= calibration_limit:
-                                    stable_error_us = Counter(error_samples).most_common(1)[0][0]
-                                    print(f"[*] Estabilidade em: {stable_error_us} us")
+                                    stable_error_ticks = Counter(error_samples).most_common(1)[0][0]
+                                    print(f"[*] Estabilidade em: {stable_error_ticks} ticks")
                                 continue 
 
                             # 2. Filtro de Jitter (Tolerância de 2us)
-                            if abs(current_err_us - stable_error_us) > 2:
+                            if abs(current_err_ticks - stable_error_ticks) > 100:
                                 continue
 
                             # 3. CÁLCULO DO OFFSET DINÂMICO
                             # Aplicando a tua fórmula: (current_err - 1) / 4
-                            offset_us = (current_err_us - 1.0) / 4.0
-                            dt_s = offset_us / 1000000.0
+                            offset_ns = (current_err_ticks) / 16.667
+                            dt_s = offset_ns / 1000000000.0
                             
                             # 4. COMPENSAÇÃO DA POSIÇÃO 2
                             # v2_deg_s = RPM * 6
@@ -162,23 +162,24 @@ def udp_logger():
                         
                         val = [float(x.strip()) for x in parts]
                         # Estrutura: [0]t_us, [1]pos1, [2]pos2, [3]v1, [4]v2, [5]err_g, [6]err_us
-                        current_err_us = val[6]
+                        current_err_ticks = val[6]
 
                         # 1. FASE DE CALIBRAÇÃO: Identifica o erro_us mais frequente
                         if stable_error_us is None:
-                            error_samples.append(current_err_us)
+                            error_samples.append(current_err_ticks)
                             if len(error_samples) >= calibration_limit:
-                                stable_error_us = Counter(error_samples).most_common(1)[0][0]
-                                print(f"[*] UDP: Estabilidade detetada em {stable_error_us} us")
+                                stable_error_ticks = Counter(error_samples).most_common(1)[0][0]
+                                print(f"[*] UDP: Estabilidade detetada em {stable_error_ticks} ticks")
                             continue
 
                         # 2. FILTRAGEM DE JITTER: Aceita apenas amostras estáveis (+/- 2us)
-                        if abs(current_err_us - stable_error_us) > 2:
+                        if abs(current_err_ticks - stable_error_ticks) > 2:
                             continue
 
                         # 3. CÁLCULO DO OFFSET DINÂMICO (Tua fórmula)
                         # O desfasamento entre Encoder 1 e 2 é (erro_total - 1) / 4
-                        offset_us = (current_err_us - 1.0) / 4.0
+                        offset_ticks = (current_err_ticks - 1.0) / 4.0
+                        offset_us = offset_ticks / 16.667  # ticks -> us (assumindo 16.667 ticks/us)
                         dt_s = offset_us / 1000000.0
                         
                         # Correção da posição 2 (v2_rpm * 6 = graus por segundo)

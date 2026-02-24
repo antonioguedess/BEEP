@@ -1,219 +1,292 @@
-// --- Includes ---
 #include <stdio.h>
 #include <string.h>
-#include "driver/pulse_cnt.h"
-#include "driver/gpio.h"
-#include "hal/pcnt_ll.h"
-#include "esp_timer.h"
-#include "esp_err.h"
-#include "esp_pm.h"
+#include <inttypes.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
 #include "freertos/queue.h"
+
+#include "esp_err.h"
+#include "esp_pm.h"
+#include "esp_cpu.h"
+#include "esp_attr.h"
 #include "nvs_flash.h"
 
-// --- Hardware ---
+#include "driver/pulse_cnt.h"
+#include "driver/gptimer.h"
+#include "driver/gpio.h"
+
+#include "hal/pcnt_ll.h"
+#include "xtensa/core-macros.h"
+
+// ---------------- Hardware ----------------
 #define ENC1_A 18
 #define ENC1_B 19
 #define ENC1_Z 21
 #define ENC2_A 22
 #define ENC2_B 23
 #define ENC2_Z 25
+
 #define PPR 3840
 
-#define BATCH_SIZE 100
-#define SINGLE_ENTRY_SIZE 80 // Tamanho estimado de cada linha
-char buffer_A[BATCH_SIZE * SINGLE_ENTRY_SIZE];
-char buffer_B[BATCH_SIZE * SINGLE_ENTRY_SIZE];
-
-char* volatile write_ptr = buffer_A;
-char* volatile read_ptr = NULL;
-int current_buffer_len = 0;
-
-// --- Frequencies ---
-#define FREQUENCY_HZ 2400 
+#define CPU_MHZ 240
+// ---------------- Frequência de amostragem ----------------
+#define FREQUENCY_HZ 2400
 #define PERIOD_US (1000000 / FREQUENCY_HZ)
 
-// --- Global Variables ---
-int lastPos1 = 0, lastPos2 = 0, lastZ1 = 0, lastZ2 = 0; 
-pcnt_unit_handle_t pcntHandle1, pcntHandle2, pcntHandleZ1, pcntHandleZ2; 
-const float delta_t_min = (1.0f / FREQUENCY_HZ) / 60.0f; 
+// ---------------- Print batching ----------------
+#define BATCH_SIZE 100
+#define SINGLE_ENTRY_SIZE 96
+static char buffer_A[BATCH_SIZE * SINGLE_ENTRY_SIZE];
+static int current_buffer_len = 0;
 
-// Estrutura para passar dados da ISR para a Main
-typedef struct {
-    int64_t t;
-    int p1, p2;
-    float v1, v2, erro;
-    int ticks;
-} data_sample_t;
+// ---------------- PCNT handles ----------------
+static pcnt_unit_handle_t pcntHandle1, pcntHandle2, pcntHandleZ1, pcntHandleZ2;
 
-QueueHandle_t data_queue;
+// Estado (processado na task)
+static int lastPos1 = 0, lastPos2 = 0, lastZ1 = 0, lastZ2 = 0;
+static const float delta_t_min = (1.0f / FREQUENCY_HZ) / 60.0f; // (s) / 60 -> usado no teu cálculo
 
-// --- High Precision Callback ---
-// This function is triggered by a hardware timer interrupt at a fixed frequency (e.g., 1kHz)
-static void IRAM_ATTR periodic_timer_callback(void* arg) {
+// ---------------- CCOUNT (ciclos CPU) ----------------
+static volatile uint32_t ccount_overhead = 0;
 
-    int64_t t1 = esp_timer_get_time();
-    int16_t c1 = pcnt_ll_get_count(&PCNT, 0); 
-    int16_t c2 = pcnt_ll_get_count(&PCNT, 1);
-    int16_t z1 = pcnt_ll_get_count(&PCNT, 2);
-    int16_t z2 = pcnt_ll_get_count(&PCNT, 3);
-    int64_t t2 = esp_timer_get_time();
-
-    // Cálculos instantâneos
-    float v1 = (float)(c1 - lastPos1) / (PPR * 4.0f) / delta_t_min;
-    float v2 = (float)(c2 - lastPos2) / (PPR * 4.0f) / delta_t_min;
-    float erro = 360.0f * (float)(c1 - c2) / (PPR * 4.0f);
-
-    if (z1 != lastZ1) { 
-        pcnt_unit_clear_count(pcntHandle1); 
-        lastPos1 = 0;  // <--- IMPORTANTE: O próximo ciclo começará do 0
-        lastZ1 = z1;
-    } else { 
-        lastPos1 = c1;
-    }
-
-    if (z2 != lastZ2) { 
-        pcnt_unit_clear_count(pcntHandle2); 
-        lastPos2 = 0;  // <--- IMPORTANTE: O próximo ciclo começará do 0
-        lastZ2 = z2;
-    } else { 
-        lastPos2 = c2;
-    }
-
-    data_sample_t sample = {
-        .t = t1,
-        .p1 = c1,
-        .p2 = c2,
-        .v1 = v1,
-        .v2 = v2,
-        .erro = erro,
-        .ticks = (int)(t2 - t1) // Now measuring only the high-speed part!
-    };
-
-    // 2. Send the structure to the queue
-    xQueueSendFromISR(data_queue, &sample, NULL);
+static inline uint32_t IRAM_ATTR ccount_barrier(void) {
+    uint32_t c;
+    asm volatile ("rsr.ccount %0" : "=a"(c));
+    asm volatile ("" ::: "memory");
+    return c;
 }
 
-// --- Setup Pulse Counter (PCNT) Unit ---
-// This function initializes a hardware pulse counter unit for either Quadrature Encoders (4x) or simple Pulse Counting (Index/Z)
-pcnt_unit_handle_t setupPCNT(gpio_num_t pinA, gpio_num_t pinB, bool quadrature) {
-    
-    // 1. Unit Configuration
-    // Defines the 16-bit hardware counter limits and enables overflow accumulation (accum_count)
-    pcnt_unit_config_t unit_config = { 
-        .high_limit = 32767, 
-        .low_limit = -32768, 
-        .flags.accum_count = true // Allows the driver to track counts beyond 16-bit limits
+static void IRAM_ATTR calibrate_ccount_overhead(void) {
+    uint32_t t1 = ccount_barrier();
+    uint32_t t2 = ccount_barrier();
+    ccount_overhead = (t2 - t1);
+}
+
+// ---------------- Struct cru vindo da ISR (só inteiros!) ----------------
+typedef struct {
+    uint64_t t_us;          // timestamp REAL do GPTimer (1 tick = 1 us)
+    uint32_t t_cycles;      // CCOUNT (para medir janelas curtas)
+    int16_t  c1, c2;
+    int16_t  z1, z2;
+    uint32_t ticks_cycles;  // (t2 - t1) - overhead
+} isr_sample_t;
+
+static QueueHandle_t isr_queue;
+
+// ---------------- GPTimer ----------------
+static gptimer_handle_t gptimer = NULL;
+
+// ---------------- PCNT setup ----------------
+static pcnt_unit_handle_t setupPCNT(gpio_num_t pinA, gpio_num_t pinB, bool quadrature) {
+    pcnt_unit_config_t unit_config = {
+        .high_limit = 32767,
+        .low_limit  = -32768,
+        .flags.accum_count = true
     };
+
     pcnt_unit_handle_t unit = NULL;
     ESP_ERROR_CHECK(pcnt_new_unit(&unit_config, &unit));
-    
-    // 2. Glitch Filter Configuration (Signal Debouncing)
-    // Ignores pulses shorter than 1000ns to eliminate high-frequency electromagnetic noise from motors
+
     pcnt_glitch_filter_config_t filter_config = {
-        .max_glitch_ns = 1000 
+        .max_glitch_ns = 1000
     };
     ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(unit, &filter_config));
-    //ESP_ERROR_CHECK(pcnt_unit_enable_glitch_filter(unit)); // Hardware-level noise suppression enabled
+    // Se quiseres mesmo ativar: (recomendo)
 
-    // 3. Channel Configuration
-    // Assigns physical GPIOs to the PCNT unit
     pcnt_chan_config_t chan_config = {
-        .edge_gpio_num = pinA, 
-        .level_gpio_num = quadrature ? pinB : -1 // If quadrature, B level informs direction
+        .edge_gpio_num  = pinA,
+        .level_gpio_num = quadrature ? pinB : -1
     };
-    pcnt_channel_handle_t chan = NULL;
-    ESP_ERROR_CHECK(pcnt_new_channel(unit, &chan_config, &chan));
+
+    pcnt_channel_handle_t chanA = NULL;
+    ESP_ERROR_CHECK(pcnt_new_channel(unit, &chan_config, &chanA));
 
     if (quadrature) {
-        // --- 4x Decoding Logic (Quadrature Mode) ---
-        // Setup Channel A: Actions for rising/falling edges based on Channel B level
-        pcnt_channel_set_edge_action(chan, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE);
-        pcnt_channel_set_level_action(chan, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
-        
-        // Setup Channel B: Required for full 4x resolution (decodes all transitions)
+        // Canal A
+        ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chanA,
+            PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE));
+        ESP_ERROR_CHECK(pcnt_channel_set_level_action(chanA,
+            PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
+
+        // Canal B
         pcnt_chan_config_t chanB_cfg = {
-            .edge_gpio_num = pinB, 
+            .edge_gpio_num  = pinB,
             .level_gpio_num = pinA
         };
         pcnt_channel_handle_t chanB = NULL;
         ESP_ERROR_CHECK(pcnt_new_channel(unit, &chanB_cfg, &chanB));
-        
-        // Setup Channel B Actions: Inverse logic compared to Channel A to correctly increment/decrement
-        pcnt_channel_set_edge_action(chanB, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE);
-        pcnt_channel_set_level_action(chanB, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+
+        ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chanB,
+            PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE));
+        ESP_ERROR_CHECK(pcnt_channel_set_level_action(chanB,
+            PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
     } else {
-        // --- Single Pulse Mode (Index/Z Pin) ---
-        // Simply increments the counter on every rising edge of the Z signal
-        pcnt_channel_set_edge_action(chan, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_HOLD);
+        // Z: conta só rising edge
+        ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chanA,
+            PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_HOLD));
     }
 
-    // 4. Hardware Initialization and Startup
-    ESP_ERROR_CHECK(pcnt_unit_enable(unit));  // Enable the PCNT unit power/clock
-    ESP_ERROR_CHECK(pcnt_unit_clear_count(unit)); // Reset counter to zero
-    ESP_ERROR_CHECK(pcnt_unit_start(unit));   // Begin autonomous hardware counting
-    
-    return unit; // Return the handle for future hardware interaction
+    ESP_ERROR_CHECK(pcnt_unit_enable(unit));
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(unit));
+    ESP_ERROR_CHECK(pcnt_unit_start(unit));
+
+    return unit;
 }
 
-void app_main(void) {
-    // Forçar o CPU a 240MHz constantes e desativar power management
+// ---------------- GPTimer callback (ISR) — SEM floats ----------------
+static bool IRAM_ATTR gptimer_callback(gptimer_handle_t timer,
+                                       const gptimer_alarm_event_data_t *edata,
+                                       void *user_data)
+{
+    (void)edata; (void)user_data;
+
+    // 1) timestamp REAL do GPTimer (us)
+    uint64_t now_us = 0;
+    gptimer_get_raw_count(timer, &now_us);
+
+    // 2) mede janela curta em ciclos (CCOUNT)
+    asm volatile ("" ::: "memory");
+    uint32_t t1 = ccount_barrier();
+
+    int16_t c1 = pcnt_ll_get_count(&PCNT, 0);
+    int16_t c2 = pcnt_ll_get_count(&PCNT, 1);
+    int16_t z1 = pcnt_ll_get_count(&PCNT, 2);
+    int16_t z2 = pcnt_ll_get_count(&PCNT, 3);
+
+    uint32_t t2 = ccount_barrier();
+    asm volatile ("" ::: "memory");
+
+    uint32_t raw = (t2 - t1);
+    uint32_t ticks = (raw > ccount_overhead) ? (raw - ccount_overhead) : 0;
+
+    // 3) Reagendar próximo alarme (timer free-running)
+    static uint64_t next_alarm = 0;
+    if (next_alarm == 0) {
+        next_alarm = now_us + PERIOD_US;   // inicializa na 1ª chamada
+    } else {
+        next_alarm += PERIOD_US;           // mantém a fase ideal
+    }
+
+    gptimer_alarm_config_t next = {
+        .alarm_count = next_alarm,
+    };
+    gptimer_set_alarm_action(timer, &next);
+
+    // 4) Enviar para a queue
+    isr_sample_t s = {
+        .t_us = now_us,
+        .t_cycles = t1,
+        .c1 = c1, .c2 = c2, .z1 = z1, .z2 = z2,
+        .ticks_cycles = ticks,
+    };
+
+    BaseType_t hp_task_woken = pdFALSE;
+    xQueueSendFromISR(isr_queue, &s, &hp_task_woken);
+    return (hp_task_woken == pdTRUE);
+}
+
+// ---------------- app_main ----------------
+void app_main(void)
+{
+    // Fixar frequências (só tem efeito se PM estiver ativo no sdkconfig)
     esp_pm_config_t pm_config = {
-        .max_freq_mhz = 240,
-        .min_freq_mhz = 240,
+        .max_freq_mhz = CPU_MHZ,
+        .min_freq_mhz = CPU_MHZ,
         .light_sleep_enable = false
     };
     esp_pm_configure(&pm_config);
 
-    nvs_flash_init();
+    ESP_ERROR_CHECK(nvs_flash_init());
 
-    // Initialize the queue for 150 samples
-    data_queue = xQueueCreate(150, sizeof(data_sample_t));
-
-    if (data_queue == NULL) {
-        printf("Failed to create queue!\n");
+    // Queue de amostras cruas da ISR
+    isr_queue = xQueueCreate(300, sizeof(isr_sample_t)); // ~125 ms de folga a 2400 Hz
+    if (!isr_queue) {
+        printf("Failed to create isr_queue!\n");
         return;
     }
 
+    // PCNT: 2 quadraturas + 2 Z
     pcntHandle1  = setupPCNT(ENC1_A, ENC1_B, true);
     pcntHandle2  = setupPCNT(ENC2_A, ENC2_B, true);
     pcntHandleZ1 = setupPCNT(ENC1_Z, -1, false);
     pcntHandleZ2 = setupPCNT(ENC2_Z, -1, false);
 
-    const esp_timer_create_args_t timer_args = { .callback = &periodic_timer_callback, .name = "phys" };
-    esp_timer_handle_t timer;
-    esp_timer_create(&timer_args, &timer);
-    esp_timer_start_periodic(timer, PERIOD_US);
+    calibrate_ccount_overhead();
+    printf("ccount_overhead=%u cycles\n", (unsigned)ccount_overhead);
 
-    printf("timestamp_us,pos1,pos2,vel1,vel2,erro_g,ticks\n");
+    // GPTimer: 1 MHz (1 tick = 1 us), alarme a PERIOD_US
+    gptimer_config_t tconf = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = 1000000
+    };
+    ESP_ERROR_CHECK(gptimer_new_timer(&tconf, &gptimer));
 
-    data_sample_t received_sample;
-    int count = 0; // Declare count HERE, before the while loop
+    gptimer_event_callbacks_t cbs = {
+        .on_alarm = gptimer_callback,
+    };
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
+    ESP_ERROR_CHECK(gptimer_enable(gptimer));
+
+    gptimer_alarm_config_t alarm = {
+        .alarm_count = PERIOD_US,              // primeiro disparo em PERIOD_US
+        .flags.auto_reload_on_alarm = false,   // IMPORTANTÍSSIMO
+    };
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm));
+    ESP_ERROR_CHECK(gptimer_start(gptimer));
+
+    // CSV header
+    printf("timestamp_us,pos1,pos2,vel1_rpm,vel2_rpm,erro_g,ticks_cycles\n");
+
+    int count = 0;
+    buffer_A[0] = '\0';
+    current_buffer_len = 0;
 
     while (1) {
-        if (xQueueReceive(data_queue, &received_sample, portMAX_DELAY)) {
-            
-            // Usamos buffer_A diretamente para simplificar
-            int space_left = (BATCH_SIZE * SINGLE_ENTRY_SIZE) - current_buffer_len;
-            
-            int written = snprintf(buffer_A + current_buffer_len, space_left,
-                                   "$%lld,%d,%d,%.2f,%.2f,%.4f,%d\n",
-                                   received_sample.t, received_sample.p1, 
-                                   received_sample.p2, received_sample.v1, 
-                                   received_sample.v2, received_sample.erro, 
-                                   received_sample.ticks);
+        isr_sample_t s;
+        if (xQueueReceive(isr_queue, &s, portMAX_DELAY)) {
 
+            // timestamp em us (ciclos / MHz). Isto dá us truncado (ok para logging)
+            uint32_t t_us = s.t_us;
+
+            // Cálculos (floats) FORA da ISR
+            float v1 = (float)(s.c1 - lastPos1) / (PPR * 4.0f) / delta_t_min;
+            float v2 = (float)(s.c2 - lastPos2) / (PPR * 4.0f) / delta_t_min;
+            float erro = 360.0f * (float)(s.c1 - s.c2) / (PPR * 4.0f);
+
+            // Tratamento do Z e clear_count FORA da ISR
+            if (s.z1 != lastZ1) {
+                pcnt_unit_clear_count(pcntHandle1);
+                lastPos1 = 0;
+                lastZ1 = s.z1;
+            } else {
+                lastPos1 = s.c1;
+            }
+
+            if (s.z2 != lastZ2) {
+                pcnt_unit_clear_count(pcntHandle2);
+                lastPos2 = 0;
+                lastZ2 = s.z2;
+            } else {
+                lastPos2 = s.c2;
+            }
+
+            int space_left = (BATCH_SIZE * SINGLE_ENTRY_SIZE) - current_buffer_len;
+            int written = snprintf(buffer_A + current_buffer_len, space_left,
+                       "$%" PRIu64 ",%d,%d,%.2f,%.2f,%.4f,%" PRIu32 "\n",
+                       (uint64_t)t_us, (int)s.c1, (int)s.c2,
+                       (double)v1, (double)v2, (double)erro,
+                       (uint32_t)s.ticks_cycles);
             if (written > 0 && written < space_left) {
                 current_buffer_len += written;
             }
 
             if (++count >= BATCH_SIZE) {
-                printf("%s", buffer_A); // Imprime o bloco
-                current_buffer_len = 0;  // Reseta o tamanho
-                buffer_A[0] = '\0';     // Limpa a string
-                count = 0;              // Reseta o contador de amostras
+                printf("%s", buffer_A);
+                count = 0;
+                current_buffer_len = 0;
+                buffer_A[0] = '\0';
             }
         }
     }
