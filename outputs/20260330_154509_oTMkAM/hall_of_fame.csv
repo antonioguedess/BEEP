@@ -1,0 +1,9 @@
+Complexity,Loss,Equation
+1,0.01210665,"0.22091104"
+5,0.01135315,"(0.21961138 - Ncycles) + Ncycles"
+7,0.011162832,"(Ncycles - -1.15625) + (-0.94365746 - Ncycles)"
+9,0.010864465,"(vslip + (Ncycles - -208460.66)) + (-209534.92 - Ncycles)"
+11,0.010667307,"(((-202271.11 - Ncycles) + vslip) - (vslip - Ncycles)) + 202271.33"
+13,0.009650173,"((vslip + (Ncycles + (Ncycles - -148287.77))) + -149362.05) - (Ncycles + Ncycles)"
+15,0.008693327,"((vslip + ((Ncycles + (Ncycles - -148287.77)) + -0.32716316)) + -149361.72) - (Ncycles + Ncycles)"
+17,0.008299282,"((Ncycles - -148024.52) + Ncycles) + (((vslip + (-150173.16 - (Ncycles + Ncycles))) + -0.14945853) + vslip)"
