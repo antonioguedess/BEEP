@@ -2,68 +2,19 @@
 import pandas as pd
 
 
+# --- Dimensionless reference values ---
+# Replace these constants with the admissible values adopted for the gear material.
+P_HZ_ADMISSIBLE_MPA = 65.0 
+T_FLOW_C = -75.0
+T_MELTING_C = 166.0
+
+
 def find_temperature_column(dataframe):
     """Find the temperature column even if the CSV encoding is inconsistent."""
     for column in dataframe.columns:
         if column.startswith("Temp"):
             return column
     raise KeyError("Could not identify the temperature column in the CSV.")
-
-
-def estimate_final_wear_curve(N_cond, a_cond):
-    """
-    Define the plateau using the point immediately before the slope increase
-    at the end of the flat region of the curve.
-    """
-    if len(a_cond) == 0:
-        raise ValueError("Curve has no points to estimate a_final.")
-    if len(a_cond) < 4:
-        return a_cond[-1]
-
-    delta_N = np.diff(N_cond)
-    delta_a = np.diff(a_cond)
-    valid_mask = delta_N > 0
-
-    if not np.any(valid_mask):
-        return a_cond[-1]
-
-    slopes = delta_a[valid_mask] / delta_N[valid_mask]
-    point_indices = np.flatnonzero(valid_mask)
-
-    if len(slopes) < 4:
-        return a_cond[point_indices[-1]]
-
-    window = min(3, len(slopes))
-    kernel = np.ones(window) / window
-    smoothed_slopes = np.convolve(slopes, kernel, mode="same")
-
-    search_start = len(smoothed_slopes) // 2
-    search_slopes = smoothed_slopes[search_start:]
-    positive_slopes = search_slopes[search_slopes > 0]
-
-    if len(positive_slopes) == 0:
-        return a_cond[point_indices[-1]]
-
-    n_base = max(3, int(np.ceil(len(positive_slopes) * 0.4)))
-    baseline_slopes = np.sort(positive_slopes)[:n_base]
-    baseline_slope = np.median(baseline_slopes)
-    baseline_spread = np.std(baseline_slopes)
-    rise_threshold = max(baseline_slope * 2.5, baseline_slope + 3 * baseline_spread, 1e-12)
-
-    rise_index = None
-    run_min = 3
-
-    for idx in range(search_start, len(smoothed_slopes) - run_min + 1):
-        segment = smoothed_slopes[idx : idx + run_min]
-        if np.all(segment > rise_threshold) and np.all(np.diff(segment) >= -rise_threshold * 0.15):
-            rise_index = idx
-            break
-
-    if rise_index is None:
-        rise_index = search_start + np.argmax(search_slopes)
-
-    plateau_point = point_indices[max(rise_index - 1, 0)]
-    return a_cond[plateau_point]
 
 
 def calculate_metrics(actual_wear, predicted_wear):
@@ -76,90 +27,222 @@ def calculate_metrics(actual_wear, predicted_wear):
     return mse, rmse, r2
 
 
-def fit_sigmoidal_model(actual_wear, a_final, base_term, candidate_exponents):
-    """Test several exponents for a generating function and keep the best fit."""
+def enforce_monotonic_wear_by_condition(dataframe, predicted_wear, condition_columns):
+    """Force the predicted wear to be non-decreasing with N within each condition."""
+    prediction_frame = dataframe[condition_columns + ["N"]].copy()
+    prediction_frame["predicted_wear_raw"] = predicted_wear
+    prediction_frame["row_id"] = np.arange(len(prediction_frame))
+
+    corrected_groups = []
+    for _, group in prediction_frame.groupby(condition_columns, sort=False):
+        ordered_group = group.sort_values("N").copy()
+        ordered_group["predicted_wear"] = np.maximum.accumulate(ordered_group["predicted_wear_raw"].values)
+        corrected_groups.append(ordered_group[["row_id", "predicted_wear"]])
+
+    corrected_frame = pd.concat(corrected_groups, ignore_index=True).sort_values("row_id")
+    return corrected_frame["predicted_wear"].to_numpy()
+
+
+def fit_power_law_model(N_values, P_hz_values, v_slip_values, mold_temperature_values, wear_values):
+    """Fit a power-law model a = A * N^b * P_hz^c * v_slip^d * T_mold^e."""
+    positive_mask = (
+        (N_values > 0)
+        & (P_hz_values > 0)
+        & (v_slip_values > 0)
+        & (mold_temperature_values > 0)
+        & (wear_values > 0)
+    )
+    if not np.any(positive_mask):
+        return None
+
+    log_design = np.column_stack(
+        [
+            np.ones(np.sum(positive_mask)),
+            np.log(N_values[positive_mask]),
+            np.log(P_hz_values[positive_mask]),
+            np.log(v_slip_values[positive_mask]),
+            np.log(mold_temperature_values[positive_mask]),
+        ]
+    )
+    log_wear = np.log(wear_values[positive_mask])
+    coefficients = np.linalg.lstsq(log_design, log_wear, rcond=None)[0]
+
+    fitted = {
+        "a": float(np.exp(coefficients[0])),
+        "b_N": float(coefficients[1]),
+        "c_Phz": float(coefficients[2]),
+        "d_vslip": float(coefficients[3]),
+        "e_Tmolde": float(coefficients[4]),
+    }
+    predicted_wear = (
+        fitted["a"]
+        * (N_values[positive_mask] ** fitted["b_N"])
+        * (P_hz_values[positive_mask] ** fitted["c_Phz"])
+        * (v_slip_values[positive_mask] ** fitted["d_vslip"])
+        * (mold_temperature_values[positive_mask] ** fitted["e_Tmolde"])
+    )
+    mse, rmse, r2 = calculate_metrics(wear_values[positive_mask], predicted_wear)
+    fitted["positive_rows"] = int(np.sum(positive_mask))
+    fitted["predicted_wear"] = predicted_wear
+    fitted["mse"] = float(mse)
+    fitted["rmse"] = float(rmse)
+    fitted["r2"] = float(r2)
+    return fitted
+
+
+def fit_kw_model(actual_wear, base_term):
+    """Fit an equivalent scalar coefficient for a direct wear formulation."""
     best = None
-    epsilon = 1e-10
-    wear_ratio = np.clip(actual_wear / a_final, epsilon, 1 - epsilon)
-    transformed_wear = -np.log(1 - wear_ratio)
+    denominator = np.sum(base_term**2)
+    if denominator <= 0:
+        return None
 
-    for exponent in candidate_exponents:
-        transformed_input = (base_term**exponent) / a_final
-        denominator = np.sum(transformed_input**2)
-        if denominator <= 0:
-            continue
+    equivalent_coefficient = np.sum(base_term * actual_wear) / denominator
+    if equivalent_coefficient <= 0:
+        return None
 
-        zeta = np.sum(transformed_input * transformed_wear) / denominator
-        predicted_wear = a_final * (1 - np.exp(-zeta * transformed_input))
-        mse, rmse, r2 = calculate_metrics(actual_wear, predicted_wear)
+    predicted_wear = equivalent_coefficient * base_term
+    mse, rmse, r2 = calculate_metrics(actual_wear, predicted_wear)
 
-        candidate = {
-            "exponent": float(exponent),
-            "zeta": float(zeta),
-            "predicted_wear": predicted_wear,
-            "mse": float(mse),
-            "rmse": float(rmse),
-            "r2": float(r2),
-            "ss_res": float(np.sum((actual_wear - predicted_wear) ** 2)),
-            "ss_tot": float(np.sum((actual_wear - np.mean(actual_wear)) ** 2)),
-        }
-
-        if best is None or candidate["r2"] > best["r2"]:
-            best = candidate
+    best = {
+        "equivalent_coefficient": float(equivalent_coefficient),
+        "predicted_wear": predicted_wear,
+        "mse": float(mse),
+        "rmse": float(rmse),
+        "r2": float(r2),
+        "ss_res": float(np.sum((actual_wear - predicted_wear) ** 2)),
+        "ss_tot": float(np.sum((actual_wear - np.mean(actual_wear)) ** 2)),
+    }
 
     return best
 
 
-def build_condition_scaling(P_hz_values, v_slip_values, mold_temperature_values):
+def build_condition_scaling(P_hz_values, N_values, mold_temperature_values):
     """Build scaling statistics for condition variables."""
     return {
         "P_hz_mean": float(np.mean(P_hz_values)),
         "P_hz_std": float(max(np.std(P_hz_values), 1e-12)),
-        "v_slip_mean": float(np.mean(v_slip_values)),
-        "v_slip_std": float(max(np.std(v_slip_values), 1e-12)),
+        "N_mean": float(np.mean(N_values)),
+        "N_std": float(max(np.std(N_values), 1e-12)),
         "T_mold_mean": float(np.mean(mold_temperature_values)),
         "T_mold_std": float(max(np.std(mold_temperature_values), 1e-12)),
     }
 
 
-def build_condition_feature_matrix(P_hz_values, v_slip_values, mold_temperature_values, scaling):
+def build_condition_feature_matrix(P_hz_values, N_values, mold_temperature_values, scaling):
     """Build a scaled polynomial feature matrix for condition-dependent parameters."""
     p_scaled = (P_hz_values - scaling["P_hz_mean"]) / scaling["P_hz_std"]
-    v_scaled = (v_slip_values - scaling["v_slip_mean"]) / scaling["v_slip_std"]
+    N_scaled = (N_values - scaling["N_mean"]) / scaling["N_std"]
     t_scaled = (mold_temperature_values - scaling["T_mold_mean"]) / scaling["T_mold_std"]
 
     feature_matrix = np.column_stack(
         [
             np.ones(len(P_hz_values)),
             p_scaled,
-            v_scaled,
+            N_scaled,
             t_scaled,
-            p_scaled * v_scaled,
+            p_scaled * N_scaled,
             p_scaled * t_scaled,
-            v_scaled * t_scaled,
+            N_scaled * t_scaled,
             p_scaled**2,
-            v_scaled**2,
+            N_scaled**2,
             t_scaled**2,
+            p_scaled**3,
+            N_scaled**3,
+            t_scaled**3,
+            p_scaled**2 * N_scaled,
+            p_scaled**2 * t_scaled,
+            N_scaled**2 * p_scaled,
+            N_scaled**2 * t_scaled,
+            t_scaled**2 * p_scaled,
+            t_scaled**2 * N_scaled,
+            p_scaled * N_scaled * t_scaled,
+            p_scaled**4,
+            N_scaled**4,
+            t_scaled**4,
+            p_scaled**3 * N_scaled,
+            p_scaled**3 * t_scaled,
+            N_scaled**3 * p_scaled,
+            N_scaled**3 * t_scaled,
+            t_scaled**3 * p_scaled,
+            t_scaled**3 * N_scaled,
+            p_scaled**2 * N_scaled**2,
+            p_scaled**2 * t_scaled**2,
+            N_scaled**2 * t_scaled**2,
+            p_scaled**5,
+            N_scaled**5,
+            t_scaled**5,
+            p_scaled**4 * N_scaled,
+            p_scaled**4 * t_scaled,
+            N_scaled**4 * p_scaled,
+            N_scaled**4 * t_scaled,
+            t_scaled**4 * p_scaled,
+            t_scaled**4 * N_scaled,
+            p_scaled**3 * N_scaled**2,
+            p_scaled**3 * t_scaled**2,
+            N_scaled**3 * p_scaled**2,
+            N_scaled**3 * t_scaled**2,
+            t_scaled**3 * p_scaled**2,
+            t_scaled**3 * N_scaled**2,
+            p_scaled * N_scaled * t_scaled * (p_scaled + N_scaled + t_scaled),
         ]
     )
     feature_names = [
         "1",
         "p_scaled",
-        "v_scaled",
+        "N_scaled",
         "t_scaled",
-        "p_scaled*v_scaled",
+        "p_scaled*N_scaled",
         "p_scaled*t_scaled",
-        "v_scaled*t_scaled",
+        "N_scaled*t_scaled",
         "p_scaled^2",
-        "v_scaled^2",
+        "N_scaled^2",
         "t_scaled^2",
+        "p_scaled^3",
+        "N_scaled^3",
+        "t_scaled^3",
+        "p_scaled^2*N_scaled",
+        "p_scaled^2*t_scaled",
+        "N_scaled^2*p_scaled",
+        "N_scaled^2*t_scaled",
+        "t_scaled^2*p_scaled",
+        "t_scaled^2*N_scaled",
+        "p_scaled*N_scaled*t_scaled",
+        "p_scaled^4",
+        "N_scaled^4",
+        "t_scaled^4",
+        "p_scaled^3*N_scaled",
+        "p_scaled^3*t_scaled",
+        "N_scaled^3*p_scaled",
+        "N_scaled^3*t_scaled",
+        "t_scaled^3*p_scaled",
+        "t_scaled^3*N_scaled",
+        "p_scaled^2*N_scaled^2",
+        "p_scaled^2*t_scaled^2",
+        "N_scaled^2*t_scaled^2",
+        "p_scaled^5",
+        "N_scaled^5",
+        "t_scaled^5",
+        "p_scaled^4*N_scaled",
+        "p_scaled^4*t_scaled",
+        "N_scaled^4*p_scaled",
+        "N_scaled^4*t_scaled",
+        "t_scaled^4*p_scaled",
+        "t_scaled^4*N_scaled",
+        "p_scaled^3*N_scaled^2",
+        "p_scaled^3*t_scaled^2",
+        "N_scaled^3*p_scaled^2",
+        "N_scaled^3*t_scaled^2",
+        "t_scaled^3*p_scaled^2",
+        "t_scaled^3*N_scaled^2",
+        "p_scaled*N_scaled*t_scaled*(p_scaled+N_scaled+t_scaled)",
     ]
     return feature_matrix, feature_names
 
 
-def evaluate_parameter_surface(coefficients, P_hz_values, v_slip_values, mold_temperature_values, scaling):
+def evaluate_parameter_surface(coefficients, P_hz_values, N_values, mold_temperature_values, scaling):
     """Evaluate a polynomial parameter surface."""
-    features, _ = build_condition_feature_matrix(P_hz_values, v_slip_values, mold_temperature_values, scaling)
+    features, _ = build_condition_feature_matrix(P_hz_values, N_values, mold_temperature_values, scaling)
     return features @ coefficients
 
 
@@ -167,8 +250,84 @@ def format_surface_expression(coefficients, feature_names, scaling):
     """Format a polynomial parameter expression for display."""
     scale_text = (
         f"p_scaled=(P_hz-{scaling['P_hz_mean']:.6e})/{scaling['P_hz_std']:.6e}, "
-        f"v_scaled=(v_slip-{scaling['v_slip_mean']:.6e})/{scaling['v_slip_std']:.6e}, "
+        f"N_scaled=(N-{scaling['N_mean']:.6e})/{scaling['N_std']:.6e}, "
         f"t_scaled=(T_mold-{scaling['T_mold_mean']:.6e})/{scaling['T_mold_std']:.6e}"
+    )
+    terms = [f"{coefficient:.6e}*{name}" for coefficient, name in zip(coefficients, feature_names)]
+    return scale_text + "; " + " + ".join(terms)
+
+
+def build_condition_scaling(P_hz_values=None, N_values=None, mold_temperature_values=None):
+    """Build reference values for dimensionless condition variables."""
+    if P_HZ_ADMISSIBLE_MPA <= 0:
+        raise ValueError("P_HZ_ADMISSIBLE_MPA must be positive.")
+    if T_MELTING_C == T_FLOW_C:
+        raise ValueError("T_MELTING_C and T_FLOW_C must be different.")
+
+    return {
+        "P_hz_admissible": float(P_HZ_ADMISSIBLE_MPA),
+        "T_flow": float(T_FLOW_C),
+        "T_melting": float(T_MELTING_C),
+    }
+
+
+def build_condition_feature_matrix(P_hz_values, N_values, v_slip_values, mold_temperature_values, scaling):
+    """Build low-order features from dimensionless groups and slip velocity in m/s."""
+    pressure_ratio = P_hz_values / scaling["P_hz_admissible"]
+    cycle_ratio = N_values / 1e5
+    temperature_ratio = (mold_temperature_values - scaling["T_flow"]) / (
+        scaling["T_melting"] - scaling["T_flow"]
+    )
+    v_slip_ms = v_slip_values / 1000.0
+
+    variables = [
+        ("P_hz/P_hz_adm", pressure_ratio),
+        ("N/1e5", cycle_ratio),
+        ("theta_T", temperature_ratio),
+        ("v_slip_m_s", v_slip_ms),
+    ]
+    feature_columns = [np.ones(len(P_hz_values))]
+    feature_names = ["1"]
+
+    for degree in range(1, 4):
+        for start_index in range(len(variables)):
+            name, values = variables[start_index]
+            terms = [(name, values, start_index)]
+            for _ in range(degree - 1):
+                next_terms = []
+                for term_name, term_values, min_index in terms:
+                    for variable_index in range(min_index, len(variables)):
+                        variable_name, variable_values = variables[variable_index]
+                        next_terms.append(
+                            (
+                                f"{term_name}*{variable_name}",
+                                term_values * variable_values,
+                                variable_index,
+                            )
+                        )
+                terms = next_terms
+
+            for term_name, term_values, _ in terms:
+                feature_names.append(term_name)
+                feature_columns.append(term_values)
+
+    return np.column_stack(feature_columns), feature_names
+
+
+def evaluate_parameter_surface(coefficients, P_hz_values, N_values, v_slip_values, mold_temperature_values, scaling):
+    """Evaluate a polynomial parameter surface."""
+    features, _ = build_condition_feature_matrix(P_hz_values, N_values, v_slip_values, mold_temperature_values, scaling)
+    return features @ coefficients
+
+
+def format_surface_expression(coefficients, feature_names, scaling):
+    """Format a polynomial parameter expression for display."""
+    scale_text = (
+        f"pi_p=P_hz/{scaling['P_hz_admissible']:.6e}, "
+        "n_cycle=N/1e5, "
+        f"theta_T=(T_mold-{scaling['T_flow']:.6e})/"
+        f"({scaling['T_melting']:.6e}-{scaling['T_flow']:.6e}), "
+        "v_slip_m_s=v_slip/1000"
     )
     terms = [f"{coefficient:.6e}*{name}" for coefficient, name in zip(coefficients, feature_names)]
     return scale_text + "; " + " + ".join(terms)
@@ -184,7 +343,38 @@ z = 30 # number of teeth
 b = 15 # tooth width in mm
 alpha = np.radians(20) # pressure angle in radians
 E_star = 3100 # effective Young's modulus in MPa (converted from GPa)
-a_filter = 0.2 * m
+z1 = z # constant number of teeth of gear 1
+z2 = 30 # number of teeth of gear 2
+u = z2 / z1 # transmission ratio
+alpha_n = alpha # normal pressure angle in radians
+beta = np.radians(0.0) # helix angle in radians
+beta_b = np.arcsin(np.sin(beta) * np.cos(alpha_n)) # base helix angle in radians
+alpha_t = np.arctan(np.tan(alpha_n) / np.cos(beta)) # transverse pressure angle in radians
+m_n = m # normal module in mm
+m_t = m_n / np.cos(beta) # transverse module in mm
+d1 = m_t * z1 # reference diameter of gear 1 in mm
+d2 = m_t * z2 # reference diameter of gear 2 in mm
+d_b1 = d1 * np.cos(alpha_t) # base diameter of gear 1 in mm
+d_b2 = d2 * np.cos(alpha_t) # base diameter of gear 2 in mm
+a = (d1 + d2) / 2.0 # center distance in mm
+d_w1 = (2 * a * z1) / (z1 + z2) # working pitch diameter of gear 1 in mm
+d_w2 = (2 * a * z2) / (z1 + z2) # working pitch diameter of gear 2 in mm
+alpha_wt = np.arccos(np.clip(d_b1 / d_w1, -1.0, 1.0)) # operating transverse pressure angle in radians
+h_aP0 = m_n # standard addendum height in mm
+d_a1 = d1 + 2 * h_aP0 # addendum diameter of gear 1 in mm
+d_a2 = d2 + 2 * h_aP0 # addendum diameter of gear 2 in mm
+x_sum = ((np.tan(alpha_wt) - alpha_wt - np.tan(alpha_t) + alpha_t) * (z1 + z2)) / (2 * np.tan(alpha_n))
+epsilon_1 = (z1 / (2 * np.pi)) * (np.sqrt((d_a1 / d_b1) ** 2 - 1) - np.tan(alpha_wt))
+epsilon_2 = (z2 / (2 * np.pi)) * (np.sqrt((d_a2 / d_b2) ** 2 - 1) - np.tan(alpha_wt))
+epsilon_alpha = epsilon_1 + epsilon_2
+epsilon_beta = (b * np.sin(beta)) / (m_n * np.pi)
+d_Nf1 = np.sqrt((2 * a * np.sin(alpha_wt) - np.sqrt(d_a2**2 - d_b2**2)) ** 2 + d_b1**2)
+d_Nf2 = np.sqrt((2 * a * np.sin(alpha_wt) - np.sqrt(d_a1**2 - d_b1**2)) ** 2 + d_b2**2)
+l_f = (((d_a1 / 2.0) ** 2) - ((d_Nf1 / 2.0) ** 2)) / d_b1 # contact length in mm
+H_v = (
+    (np.pi * (u + 1.0)) / (z2 * np.cos(beta_b))
+    * (1 - epsilon_1 - epsilon_2 + epsilon_1**2 + epsilon_2**2)
+)
 
 # --- Pitch radius ---
 r_mm = (m * z) / 2 # in mm
@@ -215,290 +405,158 @@ T_molde = T_molde[positive_mask]
 desgaste_linear = desgaste_linear[positive_mask]
 torque = torque[positive_mask]
 n = n[positive_mask]
+T1 = torque
+wk_multiplier = ((2 * np.pi * T1 * H_v) * N) / (b * l_f * z1)
 
 # --- Input matrix (without normalization) ---
 inputs = np.column_stack([N, P_hz, v_slip, T_molde])
 observed_wear = desgaste_linear
-
-# --- Calculate geometric factor Y and Delta K ---
-W = b
-a_over_W = desgaste_linear / W
-Y = 16.70 - 104.7 * a_over_W + 369.9 * a_over_W**2 - 573.8 * a_over_W**3 + 360.5 * a_over_W**4
-
-sigma_max = P_hz
-sigma_min = 0
-delta_K = Y * (sigma_max - sigma_min) * np.sqrt(np.pi * desgaste_linear)
 
 processed_data = pd.DataFrame(
     {
         "N": N,
         "P_hz": P_hz,
         "v_slip": v_slip,
+        "wk_multiplier": wk_multiplier,
         "T_mold": T_molde,
         "linear_wear": desgaste_linear,
-        "delta_K": delta_K,
         "torque": torque,
         "rpm": n,
     }
 )
 
-# --- Define a_final on full positive curves before applying the CSV filter ---
-a_final_by_condition = {}
+# --- Apply the N-based filter ---
+condition_columns = ["torque", "rpm", "T_mold"]
+condition_n_max = processed_data.groupby(condition_columns)["N"].transform("max")
+filtered_data = processed_data[processed_data["N"] < 0.95 * condition_n_max].copy()
+scaling = build_condition_scaling(
+    filtered_data["P_hz"].values,
+    filtered_data["N"].values,
+    filtered_data["T_mold"].values,
+)
+row_features, surface_feature_names = build_condition_feature_matrix(
+    filtered_data["P_hz"].values,
+    filtered_data["N"].values,
+    filtered_data["v_slip"].values,
+    filtered_data["T_mold"].values,
+    scaling,
+)
+N_filtered = filtered_data["N"].values
+P_hz_filtered = filtered_data["P_hz"].values
+v_slip_filtered = filtered_data["v_slip"].values
+T_mold_filtered = filtered_data["T_mold"].values
+wk_multiplier_filtered = filtered_data["wk_multiplier"].values
+wear_filtered = filtered_data["linear_wear"].values
+N_scale = np.max(N_filtered)
+N_scaled = N_filtered / N_scale
+power_law_fit = fit_power_law_model(
+    N_filtered,
+    P_hz_filtered,
+    v_slip_filtered,
+    T_mold_filtered,
+    wear_filtered,
+)
 
-for (torque_value, rpm_value, temperature_value), group in processed_data.groupby(["torque", "rpm", "T_mold"]):
-    sorted_group = group.sort_values("N")
-    N_cond = sorted_group["N"].values
-    wear_cond = sorted_group["linear_wear"].values
+# a = wk_multiplier * (C1(inputs) * N^3 + C2(inputs) * N^2 + C3(inputs) * N)
+# With C1, C2 and C3 modeled as surfaces over the inputs, this is linear in the
+# unknown surface coefficients and can be fit directly over all filtered rows.
+design_matrix = np.column_stack(
+    [
+        wk_multiplier_filtered[:, None] * (N_scaled**3)[:, None] * row_features,
+        wk_multiplier_filtered[:, None] * (N_scaled**2)[:, None] * row_features,
+        wk_multiplier_filtered[:, None] * N_scaled[:, None] * row_features,
+    ]
+)
+combined_coefficients = np.linalg.lstsq(design_matrix, wear_filtered, rcond=None)[0]
+feature_count = row_features.shape[1]
+C1_coefficients = combined_coefficients[:feature_count] / (N_scale**3)
+C2_coefficients = combined_coefficients[feature_count : 2 * feature_count] / (N_scale**2)
+C3_coefficients = combined_coefficients[2 * feature_count :] / N_scale
 
-    if len(N_cond) < 3:
-        continue
+C1_array = row_features @ C1_coefficients
+C2_array = row_features @ C2_coefficients
+C3_array = row_features @ C3_coefficients
+k_w_array = (
+    C1_array * N_filtered**3
+    + C2_array * N_filtered**2
+    + C3_array * N_filtered
+)
+W_k_array = k_w_array * wk_multiplier_filtered
+predicted_wear_raw = W_k_array
+predicted_wear = enforce_monotonic_wear_by_condition(filtered_data, predicted_wear_raw, condition_columns)
+raw_mse, raw_rmse, raw_r2 = calculate_metrics(wear_filtered, predicted_wear_raw)
+mse, rmse, r2 = calculate_metrics(wear_filtered, predicted_wear)
 
-    a_final_cond = estimate_final_wear_curve(N_cond, wear_cond)
-    a_final_cond = max(a_final_cond, np.max(wear_cond) * 1.01)
-    a_final_by_condition[(torque_value, rpm_value, temperature_value)] = a_final_cond
-
-# --- Apply the CSV filter only after a_final has been defined ---
-filtered_data = processed_data[processed_data["linear_wear"] <= a_filter].copy()
-
-candidate_models = {
-    "DeltaK_N": {
-        "exponents": np.linspace(0.25, 1.25, 21),
-        "description": "DeltaK * N",
-    },
-    "N": {
-        "exponents": np.linspace(0.25, 1.25, 21),
-        "description": "N",
-    },
-    "P_hz_v_slip_N": {
-        "exponents": np.linspace(0.20, 0.80, 25),
-        "description": "P_hz * v_slip * N",
-    },
-}
-
-condition_records_by_model = {model_name: [] for model_name in candidate_models}
-
-for (torque_value, rpm_value, temperature_value), group in filtered_data.groupby(["torque", "rpm", "T_mold"]):
-    sorted_group = group.sort_values("N")
-    N_cond = sorted_group["N"].values
-    wear_cond = sorted_group["linear_wear"].values
-    delta_K_cond = sorted_group["delta_K"].values
-    P_hz_cond = sorted_group["P_hz"].iloc[0]
-    v_slip_cond = sorted_group["v_slip"].iloc[0]
-
-    if len(N_cond) < 3:
-        continue
-
-    a_final_cond = a_final_by_condition.get((torque_value, rpm_value, temperature_value))
-    if a_final_cond is None:
-        continue
-    a_final_cond_array = np.full_like(wear_cond, a_final_cond, dtype=float)
-
-    base_terms = {
-        "DeltaK_N": delta_K_cond * N_cond,
-        "N": N_cond,
-        "P_hz_v_slip_N": sorted_group["P_hz"].values * sorted_group["v_slip"].values * N_cond,
-    }
-
-    for model_name, config in candidate_models.items():
-        result = fit_sigmoidal_model(
-            wear_cond,
-            a_final_cond_array,
-            base_terms[model_name],
-            config["exponents"],
-        )
-        if result is None:
-            continue
-
-        condition_records_by_model[model_name].append(
-            {
-                "P_hz": P_hz_cond,
-                "v_slip": v_slip_cond,
-                "T_mold": temperature_value,
-                "a_final": a_final_cond,
-                "zeta": result["zeta"],
-                "gamma": result["exponent"],
-                "rmse": result["rmse"],
-                "r2": result["r2"],
-                "ss_res": result["ss_res"],
-                "ss_tot": result["ss_tot"],
-            }
-        )
-best_model_name = None
-best_model_payload = None
-best_model_r2 = -np.inf
-
-base_terms_all = {
-    "DeltaK_N": filtered_data["delta_K"].values * filtered_data["N"].values,
-    "N": filtered_data["N"].values,
-    "P_hz_v_slip_N": filtered_data["P_hz"].values * filtered_data["v_slip"].values * filtered_data["N"].values,
-}
-
-for model_name, records in condition_records_by_model.items():
-    if not records:
-        continue
-
-    condition_dataframe = pd.DataFrame(records)
-    scaling = build_condition_scaling(
-        condition_dataframe["P_hz"].values,
-        condition_dataframe["v_slip"].values,
-        condition_dataframe["T_mold"].values,
-    )
-    condition_features, surface_feature_names = build_condition_feature_matrix(
-        condition_dataframe["P_hz"].values,
-        condition_dataframe["v_slip"].values,
-        condition_dataframe["T_mold"].values,
-        scaling,
-    )
-
-    log_a_final_coefficients = np.linalg.lstsq(
-        condition_features,
-        np.log(np.maximum(condition_dataframe["a_final"].values, 1e-12)),
-        rcond=None,
-    )[0]
-    log_zeta_coefficients = np.linalg.lstsq(
-        condition_features,
-        np.log(np.maximum(condition_dataframe["zeta"].values, 1e-18)),
-        rcond=None,
-    )[0]
-    gamma_coefficients = np.linalg.lstsq(
-        condition_features,
-        condition_dataframe["gamma"].values,
-        rcond=None,
-    )[0]
-
-    log_a_final_array = evaluate_parameter_surface(
-        log_a_final_coefficients,
-        filtered_data["P_hz"].values,
-        filtered_data["v_slip"].values,
-        filtered_data["T_mold"].values,
-        scaling,
-    )
-    log_zeta_array = evaluate_parameter_surface(
-        log_zeta_coefficients,
-        filtered_data["P_hz"].values,
-        filtered_data["v_slip"].values,
-        filtered_data["T_mold"].values,
-        scaling,
-    )
-    gamma_array = evaluate_parameter_surface(
-        gamma_coefficients,
-        filtered_data["P_hz"].values,
-        filtered_data["v_slip"].values,
-        filtered_data["T_mold"].values,
-        scaling,
-    )
-
-    a_final_array = np.exp(log_a_final_array)
-    zeta_array = np.exp(log_zeta_array)
-    gamma_array = np.clip(gamma_array, 0.20, 2.50)
-    a_final_array = np.maximum(a_final_array, filtered_data["linear_wear"].values * 1.01)
-
-    selected_base_term = base_terms_all[model_name]
-    predicted_wear = a_final_array * (
-        1 - np.exp(-zeta_array * ((selected_base_term**gamma_array) / a_final_array))
-    )
-    mse, rmse, r2 = calculate_metrics(filtered_data["linear_wear"].values, predicted_wear)
-
-    if r2 > best_model_r2:
-        best_model_r2 = r2
-        best_model_name = model_name
-        best_model_payload = {
-            "condition_dataframe": condition_dataframe,
-            "surface_feature_names": surface_feature_names,
-            "scaling": scaling,
-            "a_final_coefficients": log_a_final_coefficients,
-            "zeta_coefficients": log_zeta_coefficients,
-            "gamma_coefficients": gamma_coefficients,
-            "a_final_array": a_final_array,
-            "zeta_array": zeta_array,
-            "gamma_array": gamma_array,
-            "predicted_wear": predicted_wear,
-            "mse": mse,
-            "rmse": rmse,
-            "r2": r2,
-        }
-
-if best_model_name is None or best_model_payload is None:
-    raise RuntimeError("Could not fit any sigmoidal model to the available conditions.")
-
-condition_dataframe = best_model_payload["condition_dataframe"]
-surface_feature_names = best_model_payload["surface_feature_names"]
-scaling = best_model_payload["scaling"]
-a_final_coefficients = best_model_payload["a_final_coefficients"]
-zeta_coefficients = best_model_payload["zeta_coefficients"]
-gamma_coefficients = best_model_payload["gamma_coefficients"]
-a_final_array = best_model_payload["a_final_array"]
-zeta_array = best_model_payload["zeta_array"]
-gamma_array = best_model_payload["gamma_array"]
-predicted_wear = best_model_payload["predicted_wear"]
-mse = best_model_payload["mse"]
-rmse = best_model_payload["rmse"]
-r2 = best_model_payload["r2"]
+condition_records = []
+for (_, _, _), group in filtered_data.assign(predicted_wear=predicted_wear).groupby(["torque", "rpm", "T_mold"]):
+    group_rmse, _, group_r2 = calculate_metrics(group["linear_wear"].values, group["predicted_wear"].values)
+    condition_records.append({"rmse": group_rmse, "r2": group_r2})
+condition_dataframe = pd.DataFrame(condition_records)
 
 print("\n" + "=" * 70)
-print("SIGMOIDAL WEAR MODEL")
+print("ANALYTICAL WEAR MODEL")
 print("=" * 70)
-print("\nGeneral formula:")
-print("   a(N) = a_final(inputs) * (1 - exp(-zeta(inputs) * G(inputs)^gamma(inputs) / a_final(inputs)))")
+print(f"\nModel:")
+print("   Generic expression: a(inputs, N) = k_w(inputs, N) * ((2 * pi * T1 * H_v) * N) / (b * l_f * z1)")
+print("   a(inputs, N) = (C1(inputs) * N^3 + C2(inputs) * N^2 + C3(inputs) * N) * ((2 * pi * T1 * H_v) * N) / (b * l_f * z1)")
+print("   k_w(inputs, N) = C1(inputs) * N^3 + C2(inputs) * N^2 + C3(inputs) * N")
+if power_law_fit is not None:
+    print(
+        "   power_law(inputs) = "
+        f"{power_law_fit['a']:.6e} * N^{power_law_fit['b_N']:.6f} * P_hz^{power_law_fit['c_Phz']:.6f} "
+        f"* v_slip^{power_law_fit['d_vslip']:.6f} * T_mold^{power_law_fit['e_Tmolde']:.6f}"
+    )
+print(f"   C1(inputs) = {format_surface_expression(C1_coefficients, surface_feature_names, scaling)}")
+print(f"   C2(inputs) = {format_surface_expression(C2_coefficients, surface_feature_names, scaling)}")
+print(f"   C3(inputs) = {format_surface_expression(C3_coefficients, surface_feature_names, scaling)}")
+print(f"   H_v = (pi * (u + 1) / (z2 * cos(beta_b))) * (1 - epsilon_1 - epsilon_2 + epsilon_1^2 + epsilon_2^2) = {H_v:.6f}")
+print(f"   alpha_t = arctan(tan(alpha_n) / cos(beta)) = {alpha_t:.6f}")
+print(f"   beta_b = arcsin(sin(beta) * cos(alpha_n)) = {beta_b:.6f}")
+print(f"   m_t = m_n / cos(beta) = {m_t:.6f}")
+print(f"   alpha_wt = arccos(d_bi / d_wi) = {alpha_wt:.6f}")
+print(f"   epsilon_1 = (z1 / (2 * pi)) * (sqrt((d_a1 / d_b1)^2 - 1) - tan(alpha_wt)) = {epsilon_1:.6f}")
+print(f"   epsilon_2 = (z2 / (2 * pi)) * (sqrt((d_a2 / d_b2)^2 - 1) - tan(alpha_wt)) = {epsilon_2:.6f}")
+print(f"   epsilon_alpha = epsilon_1 + epsilon_2 = {epsilon_alpha:.6f}")
+print(f"   epsilon_beta = (b * sin(beta)) / (m_n * pi) = {epsilon_beta:.6f}")
+print(f"   l_f = (((d_a1 / 2)^2) - ((d_Nf1 / 2)^2)) / d_b1 = {l_f:.6f}")
+print(f"   a(inputs, N) = k_w(inputs, N) * ((2 * pi * T1 * H_v) * N) / (b * l_f * z1)")
 
-print(f"\nSelected generating function:")
-print(f"   {best_model_name}: {candidate_models[best_model_name]['description']}")
+print(f"\nGeometry:")
+print(f"   z1 = {z1}, z2 = {z2}, u = {u:.6f}, beta = {beta:.6f}, alpha_n = {alpha_n:.6f}")
+print(f"   d1 = {d1:.6f}, d2 = {d2:.6f}, d_w1 = {d_w1:.6f}, d_w2 = {d_w2:.6f}")
+print(f"   d_a1 = {d_a1:.6f}, d_a2 = {d_a2:.6f}, d_b1 = {d_b1:.6f}, d_b2 = {d_b2:.6f}")
+print(f"   a = {a:.6f}, h_aP0 = {h_aP0:.6f}, x1+x2 = {x_sum:.6f}, d_Nf1 = {d_Nf1:.6f}, d_Nf2 = {d_Nf2:.6f}")
 
-print(f"\na_final(inputs):")
-print("   log(a_final) = " + format_surface_expression(a_final_coefficients, surface_feature_names, scaling))
-print("   a_final = exp(log(a_final))")
+print(f"\nStats:")
+print(f"   C1[min/mean/max] = {np.min(C1_array):.6e} / {np.mean(C1_array):.6e} / {np.max(C1_array):.6e}")
+print(f"   C2[min/mean/max] = {np.min(C2_array):.6e} / {np.mean(C2_array):.6e} / {np.max(C2_array):.6e}")
+print(f"   C3[min/mean/max] = {np.min(C3_array):.6e} / {np.mean(C3_array):.6e} / {np.max(C3_array):.6e}")
+print(f"   k_w[min/mean/max] = {np.min(k_w_array):.6e} / {np.mean(k_w_array):.6e} / {np.max(k_w_array):.6e}")
+print(f"   a_pred[min/mean/max] = {np.min(predicted_wear):.6e} / {np.mean(predicted_wear):.6e} / {np.max(predicted_wear):.6e}")
+print(f"   W_k[min/mean/max] = {np.min(W_k_array):.6e} / {np.mean(W_k_array):.6e} / {np.max(W_k_array):.6e}")
+print(f"   T1[min/mean/max] = {np.min(T1):.6e} / {np.mean(T1):.6e} / {np.max(T1):.6e}")
+print("   data_filter = N < 0.95 * Nmax")
+print("   monotonic_constraint = predicted wear non-decreasing with N inside each condition")
+if power_law_fit is not None:
+    print(
+        f"   power_law_rows = {power_law_fit['positive_rows']}, "
+        f"power_law_rmse = {power_law_fit['rmse']:.6f}, power_law_r2 = {power_law_fit['r2']:.6f}"
+    )
 
-print(f"\nzeta(inputs):")
-print("   log(zeta) = " + format_surface_expression(zeta_coefficients, surface_feature_names, scaling))
-print("   zeta = exp(log(zeta))")
-
-print(f"\ngamma(inputs):")
-print("   gamma = " + format_surface_expression(gamma_coefficients, surface_feature_names, scaling))
-
-print(f"\nDelta K:")
-print("   DeltaK = Y * (sigma_max - sigma_min) * sqrt(pi * a)")
-print("   sigma_max = P_hz")
-print("   sigma_min = 0")
-print("   Y = 16.70 - 104.7*(a/W) + 369.9*(a/W)^2 - 573.8*(a/W)^3 + 360.5*(a/W)^4")
-print(f"   W = {W} mm")
-
-print(f"\nParameter statistics:")
-print(f"   a_final from fitted expression:")
-print(f"      Min: {np.min(a_final_array):.6f} mm")
-print(f"      Mean: {np.mean(a_final_array):.6f} mm")
-print(f"      Max: {np.max(a_final_array):.6f} mm")
-print(f"   zeta from fitted expression:")
-print(f"      Min: {np.min(zeta_array):.6e}")
-print(f"      Mean: {np.mean(zeta_array):.6e}")
-print(f"      Max: {np.max(zeta_array):.6e}")
-print(f"   gamma from fitted expression:")
-print(f"      Min: {np.min(gamma_array):.6f}")
-print(f"      Mean: {np.mean(gamma_array):.6f}")
-print(f"      Max: {np.max(gamma_array):.6f}")
-print(f"   DeltaK:")
-print(f"      Min: {np.min(filtered_data['delta_K'].values):.6e}")
-print(f"      Mean: {np.mean(filtered_data['delta_K'].values):.6e}")
-print(f"      Max: {np.max(filtered_data['delta_K'].values):.6e}")
-print(f"   CSV filtering limit: a_filter = 0.2 * m = {a_filter:.6f} mm")
-
-print(f"\nCondition-level fit statistics for the selected model:")
-print(f"   Total fitted conditions: {len(condition_dataframe)}")
-print(f"   Mean condition RMSE: {condition_dataframe['rmse'].mean():.6f}")
-print(f"   Mean condition R^2: {condition_dataframe['r2'].mean():.6f}")
-
-print(f"\nGlobal quality metrics:")
-print(f"   MSE: {mse:.6f}")
-print(f"   RMSE: {rmse:.6f}")
-print(f"   R^2: {r2:.6f}")
-
-print(f"\nFinal equation with explicit parameter functions:")
-print("   a(N) = a_final(inputs) * (1 - exp(-zeta(inputs) * G(inputs)^gamma(inputs) / a_final(inputs)))")
-print("   with")
-print("   log(a_final(inputs)) = " + format_surface_expression(a_final_coefficients, surface_feature_names, scaling))
-print("   a_final(inputs) = exp(log(a_final(inputs)))")
-print("   log(zeta(inputs)) = " + format_surface_expression(zeta_coefficients, surface_feature_names, scaling))
-print("   zeta(inputs) = exp(log(zeta(inputs)))")
-print("   gamma(inputs) = " + format_surface_expression(gamma_coefficients, surface_feature_names, scaling))
-print(f"   G(inputs) = {candidate_models[best_model_name]['description']}")
+print(f"\nFit:")
+print(f"   filtered_rows = {len(filtered_data)}")
+print(f"   fitted_conditions = {len(condition_dataframe)}")
+print(f"   mean_condition_rmse = {condition_dataframe['rmse'].mean():.6f}")
+print(f"   mean_condition_r2 = {condition_dataframe['r2'].mean():.6f}")
+print(f"   raw_MSE = {raw_mse:.6f}")
+print(f"   raw_RMSE = {raw_rmse:.6f}")
+print(f"   raw_R^2 = {raw_r2:.6f}")
+print(f"   MSE = {mse:.6f}")
+print(f"   RMSE = {rmse:.6f}")
+print(f"   R^2 = {r2:.6f}")
+if power_law_fit is not None:
+    print(f"   power_law_MSE = {power_law_fit['mse']:.6f}")
+    print(f"   power_law_RMSE = {power_law_fit['rmse']:.6f}")
+    print(f"   power_law_R^2 = {power_law_fit['r2']:.6f}")
 
 print("\n" + "=" * 70)
