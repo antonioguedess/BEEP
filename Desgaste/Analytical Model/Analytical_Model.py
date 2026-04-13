@@ -1,5 +1,8 @@
 ﻿import numpy as np
 import pandas as pd
+import json
+import os
+from datetime import datetime
 
 
 # --- Dimensionless reference values ---
@@ -7,6 +10,7 @@ import pandas as pd
 P_HZ_ADMISSIBLE_MPA = 65.0 
 T_FLOW_C = -75.0
 T_MELTING_C = 166.0
+SURFACE_POLYNOMIAL_DEGREE = 4
 
 
 def find_temperature_column(dataframe):
@@ -274,7 +278,6 @@ def build_condition_scaling(P_hz_values=None, N_values=None, mold_temperature_va
 def build_condition_feature_matrix(P_hz_values, N_values, v_slip_values, mold_temperature_values, scaling):
     """Build low-order features from dimensionless groups and slip velocity in m/s."""
     pressure_ratio = P_hz_values / scaling["P_hz_admissible"]
-    cycle_ratio = N_values / 1e5
     temperature_ratio = (mold_temperature_values - scaling["T_flow"]) / (
         scaling["T_melting"] - scaling["T_flow"]
     )
@@ -282,14 +285,13 @@ def build_condition_feature_matrix(P_hz_values, N_values, v_slip_values, mold_te
 
     variables = [
         ("P_hz/P_hz_adm", pressure_ratio),
-        ("N/1e5", cycle_ratio),
         ("theta_T", temperature_ratio),
         ("v_slip_m_s", v_slip_ms),
     ]
     feature_columns = [np.ones(len(P_hz_values))]
     feature_names = ["1"]
 
-    for degree in range(1, 4):
+    for degree in range(1, SURFACE_POLYNOMIAL_DEGREE + 1):
         for start_index in range(len(variables)):
             name, values = variables[start_index]
             terms = [(name, values, start_index)]
@@ -324,7 +326,6 @@ def format_surface_expression(coefficients, feature_names, scaling):
     """Format a polynomial parameter expression for display."""
     scale_text = (
         f"pi_p=P_hz/{scaling['P_hz_admissible']:.6e}, "
-        "n_cycle=N/1e5, "
         f"theta_T=(T_mold-{scaling['T_flow']:.6e})/"
         f"({scaling['T_melting']:.6e}-{scaling['T_flow']:.6e}), "
         "v_slip_m_s=v_slip/1000"
@@ -428,7 +429,7 @@ processed_data = pd.DataFrame(
 # --- Apply the N-based filter ---
 condition_columns = ["torque", "rpm", "T_mold"]
 condition_n_max = processed_data.groupby(condition_columns)["N"].transform("max")
-filtered_data = processed_data[processed_data["N"] < 0.95 * condition_n_max].copy()
+filtered_data = processed_data[processed_data["N"] < 0.99 * condition_n_max].copy()
 scaling = build_condition_scaling(
     filtered_data["P_hz"].values,
     filtered_data["N"].values,
@@ -457,11 +458,12 @@ power_law_fit = fit_power_law_model(
     wear_filtered,
 )
 
-# a = wk_multiplier * (C1(inputs) * N^3 + C2(inputs) * N^2 + C3(inputs) * N)
-# With C1, C2 and C3 modeled as surfaces over the inputs, this is linear in the
+# a = wk_multiplier * (C0(inputs) + C1(inputs) * N^3 + C2(inputs) * N^2 + C3(inputs) * N)
+# With C0, C1, C2 and C3 modeled as surfaces over the inputs, this is linear in the
 # unknown surface coefficients and can be fit directly over all filtered rows.
 design_matrix = np.column_stack(
     [
+        wk_multiplier_filtered[:, None] * row_features,
         wk_multiplier_filtered[:, None] * (N_scaled**3)[:, None] * row_features,
         wk_multiplier_filtered[:, None] * (N_scaled**2)[:, None] * row_features,
         wk_multiplier_filtered[:, None] * N_scaled[:, None] * row_features,
@@ -469,15 +471,18 @@ design_matrix = np.column_stack(
 )
 combined_coefficients = np.linalg.lstsq(design_matrix, wear_filtered, rcond=None)[0]
 feature_count = row_features.shape[1]
-C1_coefficients = combined_coefficients[:feature_count] / (N_scale**3)
-C2_coefficients = combined_coefficients[feature_count : 2 * feature_count] / (N_scale**2)
-C3_coefficients = combined_coefficients[2 * feature_count :] / N_scale
+C0_coefficients = combined_coefficients[:feature_count]
+C1_coefficients = combined_coefficients[feature_count : 2 * feature_count] / (N_scale**3)
+C2_coefficients = combined_coefficients[2 * feature_count : 3 * feature_count] / (N_scale**2)
+C3_coefficients = combined_coefficients[3 * feature_count :] / N_scale
 
+C0_array = row_features @ C0_coefficients
 C1_array = row_features @ C1_coefficients
 C2_array = row_features @ C2_coefficients
 C3_array = row_features @ C3_coefficients
 k_w_array = (
-    C1_array * N_filtered**3
+    C0_array
+    + C1_array * N_filtered**3
     + C2_array * N_filtered**2
     + C3_array * N_filtered
 )
@@ -489,7 +494,7 @@ mse, rmse, r2 = calculate_metrics(wear_filtered, predicted_wear)
 
 condition_records = []
 for (_, _, _), group in filtered_data.assign(predicted_wear=predicted_wear).groupby(["torque", "rpm", "T_mold"]):
-    group_rmse, _, group_r2 = calculate_metrics(group["linear_wear"].values, group["predicted_wear"].values)
+    _, group_rmse, group_r2 = calculate_metrics(group["linear_wear"].values, group["predicted_wear"].values)
     condition_records.append({"rmse": group_rmse, "r2": group_r2})
 condition_dataframe = pd.DataFrame(condition_records)
 
@@ -498,14 +503,15 @@ print("ANALYTICAL WEAR MODEL")
 print("=" * 70)
 print(f"\nModel:")
 print("   Generic expression: a(inputs, N) = k_w(inputs, N) * ((2 * pi * T1 * H_v) * N) / (b * l_f * z1)")
-print("   a(inputs, N) = (C1(inputs) * N^3 + C2(inputs) * N^2 + C3(inputs) * N) * ((2 * pi * T1 * H_v) * N) / (b * l_f * z1)")
-print("   k_w(inputs, N) = C1(inputs) * N^3 + C2(inputs) * N^2 + C3(inputs) * N")
+print("   a(inputs, N) = (C0(inputs) + C1(inputs) * N^3 + C2(inputs) * N^2 + C3(inputs) * N) * ((2 * pi * T1 * H_v) * N) / (b * l_f * z1)")
+print("   k_w(inputs, N) = C0(inputs) + C1(inputs) * N^3 + C2(inputs) * N^2 + C3(inputs) * N")
 if power_law_fit is not None:
     print(
         "   power_law(inputs) = "
         f"{power_law_fit['a']:.6e} * N^{power_law_fit['b_N']:.6f} * P_hz^{power_law_fit['c_Phz']:.6f} "
         f"* v_slip^{power_law_fit['d_vslip']:.6f} * T_mold^{power_law_fit['e_Tmolde']:.6f}"
     )
+print(f"   C0(inputs) = {format_surface_expression(C0_coefficients, surface_feature_names, scaling)}")
 print(f"   C1(inputs) = {format_surface_expression(C1_coefficients, surface_feature_names, scaling)}")
 print(f"   C2(inputs) = {format_surface_expression(C2_coefficients, surface_feature_names, scaling)}")
 print(f"   C3(inputs) = {format_surface_expression(C3_coefficients, surface_feature_names, scaling)}")
@@ -528,6 +534,7 @@ print(f"   d_a1 = {d_a1:.6f}, d_a2 = {d_a2:.6f}, d_b1 = {d_b1:.6f}, d_b2 = {d_b2
 print(f"   a = {a:.6f}, h_aP0 = {h_aP0:.6f}, x1+x2 = {x_sum:.6f}, d_Nf1 = {d_Nf1:.6f}, d_Nf2 = {d_Nf2:.6f}")
 
 print(f"\nStats:")
+print(f"   C0[min/mean/max] = {np.min(C0_array):.6e} / {np.mean(C0_array):.6e} / {np.max(C0_array):.6e}")
 print(f"   C1[min/mean/max] = {np.min(C1_array):.6e} / {np.mean(C1_array):.6e} / {np.max(C1_array):.6e}")
 print(f"   C2[min/mean/max] = {np.min(C2_array):.6e} / {np.mean(C2_array):.6e} / {np.max(C2_array):.6e}")
 print(f"   C3[min/mean/max] = {np.min(C3_array):.6e} / {np.mean(C3_array):.6e} / {np.max(C3_array):.6e}")
@@ -535,7 +542,7 @@ print(f"   k_w[min/mean/max] = {np.min(k_w_array):.6e} / {np.mean(k_w_array):.6e
 print(f"   a_pred[min/mean/max] = {np.min(predicted_wear):.6e} / {np.mean(predicted_wear):.6e} / {np.max(predicted_wear):.6e}")
 print(f"   W_k[min/mean/max] = {np.min(W_k_array):.6e} / {np.mean(W_k_array):.6e} / {np.max(W_k_array):.6e}")
 print(f"   T1[min/mean/max] = {np.min(T1):.6e} / {np.mean(T1):.6e} / {np.max(T1):.6e}")
-print("   data_filter = N < 0.95 * Nmax")
+print("   data_filter = N < 0.99 * Nmax")
 print("   monotonic_constraint = predicted wear non-decreasing with N inside each condition")
 if power_law_fit is not None:
     print(
@@ -560,3 +567,77 @@ if power_law_fit is not None:
     print(f"   power_law_R^2 = {power_law_fit['r2']:.6f}")
 
 print("\n" + "=" * 70)
+
+# ==================== EXPORT COEFFICIENTS FOR GEARWEARNN ====================
+power_law_reference = None
+if power_law_fit is not None:
+    power_law_reference = {
+        key: value
+        for key, value in power_law_fit.items()
+        if key != "predicted_wear"
+    }
+
+analytical_model_output = {
+    "timestamp": datetime.now().isoformat(),
+    "model_type": "analytical_cubic_polynomial",
+    "description": "Cubic polynomial surfaces for wear prediction: a = wk * (C0 + C1*N^3 + C2*N^2 + C3*N)",
+    
+    # Polynomial surface coefficients
+    "C0_coefficients": C0_coefficients.tolist(),
+    "C1_coefficients": C1_coefficients.tolist(),
+    "C2_coefficients": C2_coefficients.tolist(),
+    "C3_coefficients": C3_coefficients.tolist(),
+    "surface_feature_names": surface_feature_names,
+    "surface_polynomial_degree": int(SURFACE_POLYNOMIAL_DEGREE),
+    
+    # Scaling parameters
+    "scaling": scaling,
+    
+    # Geometry parameters
+    "geometry": {
+        "m": float(m),
+        "z": int(z),
+        "z1": int(z1),
+        "z2": int(z2),
+        "b": float(b),
+        "alpha_rad": float(alpha),
+        "E_star_MPa": float(E_star),
+        "H_v": float(H_v),
+        "l_f": float(l_f),
+        "alpha_wt_rad": float(alpha_wt),
+        "epsilon_1": float(epsilon_1),
+        "epsilon_2": float(epsilon_2),
+    },
+    
+    # Model performance metrics
+    "metrics": {
+        "filtered_rows": int(len(filtered_data)),
+        "fitted_conditions": int(len(condition_dataframe)),
+        "mean_condition_rmse": float(condition_dataframe['rmse'].mean()),
+        "mean_condition_r2": float(condition_dataframe['r2'].mean()),
+        "MSE": float(mse),
+        "RMSE": float(rmse),
+        "R_squared": float(r2),
+    },
+    
+    # Power law reference (if available)
+    "power_law_reference": power_law_reference,
+    
+    # Normalization reference
+    "N_scale": float(N_scale),
+    "N_max": float(np.max(N_filtered)),
+    "P_hz_range": [float(np.min(P_hz_filtered)), float(np.max(P_hz_filtered))],
+    "v_slip_range": [float(np.min(v_slip_filtered)), float(np.max(v_slip_filtered))],
+    "T_mold_range": [float(np.min(T_mold_filtered)), float(np.max(T_mold_filtered))],
+}
+
+# Save to file adjacent to this script
+output_dir = os.path.dirname(os.path.abspath(__file__))
+output_file = os.path.join(output_dir, "analytical_model_coefficients.json")
+
+try:
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(analytical_model_output, f, indent=2)
+    print(f"\n[OK] Analytical model coefficients exported to: {output_file}")
+except Exception as e:
+    print(f"\n[ERRO] Error saving coefficients: {e}")
